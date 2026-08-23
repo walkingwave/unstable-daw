@@ -398,6 +398,15 @@ export default function App() {
     },
     [backend, ensureSession, warnOnFallback],
   );
+
+  const uploadTimelineAudio = useCallback(
+    async (blob, name = 'clip') => {
+      const id = sessionId || (await ensureSession());
+      return apiClient.uploadSessionAudio(id, blob, name);
+    },
+    [sessionId, ensureSession],
+  );
+
   const ensureVocalTrack = useCallback(async () => {
     if (vocalAddedRef.current || !vocalWavRef.current) return;
     const buffer = await engine.context().decodeAudioData(await vocalWavRef.current.arrayBuffer());
@@ -661,6 +670,7 @@ export default function App() {
           instruments={library.instruments}
           sampler={sampler}
           backend={backend}
+          onUploadAudio={uploadTimelineAudio}
         />
       )}
 

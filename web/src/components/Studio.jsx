@@ -4,6 +4,7 @@ import MidiEditor from './MidiEditor.jsx';
 import InstrumentSlot from './InstrumentSlot.jsx';
 import StudioRecorder from './StudioRecorder.jsx';
 import * as apiClient from '../api.js';
+import { MIN_CLIP_SECONDS, trimClipPatch } from '../timelineOps.js';
 
 // Timeline studio (light, on-brand) with the controls a basic DAW needs:
 // grid, zoom, adjustable snap (incl. off-grid), Ableton-style clip gestures,
@@ -12,7 +13,7 @@ import * as apiClient from '../api.js';
 const LANE_H = 76;
 const HEADER_W = 168;
 const RULER_H = 26;
-const MIN_CLIP = 0.05;
+const MIN_CLIP = MIN_CLIP_SECONDS;
 
 const KIND_COLOR = {
   vocal: '#e6c3b3',
@@ -47,7 +48,7 @@ const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 
 export default function Studio({
   engine, bpm, keyName, mode, onBpm, onKey, onMode, detected,
   onGenerateStem, onGenerateSong, onComposeMidi, onApplySettings, onGenerateFromReference, onRenderMidi, sessionId,
-  instruments = [], onCreateInstrument, sampler, backend,
+  instruments = [], onCreateInstrument, sampler, backend, onUploadAudio,
 }) {
   const {
     tracks,
@@ -57,12 +58,16 @@ export default function Studio({
     context,
     getBuffer,
     addTrackWithClip,
+    addClip,
     moveClip,
     updateClip,
+    patchClip,
     splitClip,
     extractRegion,
     duplicateClip,
+    duplicateRegion,
     removeClip,
+    removeRegion,
     removeTrack,
     replaceRegion,
     setTrackProp,
@@ -90,11 +95,14 @@ export default function Studio({
   const [region, setRegion] = useState(null); // {clipId, a, b}
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
+  const [recentStudioOperations, setRecentStudioOperations] = useState([]);
   const scrollRef = useRef(null);
 
   const snapDiv = SNAPS.find((s) => s.id === snapId)?.div ?? 1;
   const snapSec = snapDiv > 0 ? secondsPerBar / snapDiv : 0;
   const snap = (t) => (snapSec > 0 ? Math.round(t / snapSec) * snapSec : t);
+  const quarterBarSec = secondsPerBar / 4;
+  const snapQuarterBar = (t) => Math.round(t / quarterBarSec) * quarterBarSec;
 
   const laneW = Math.max(1200, (duration + 8) * pps);
   const timeToX = (t) => t * pps;
@@ -108,6 +116,106 @@ export default function Studio({
   // timeline listen for Space on the window, so without this a single press
   // started the transport and the roll at once and everything played twice.
   const midiEditorOpen = !!(selClip && selTrack && selTrack.kind === 'midi');
+
+  const recordStudioOperation = useCallback((operation) => {
+    const entry = {
+      id: operation.id || `local-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      created_at: operation.created_at || new Date().toISOString(),
+      ...operation,
+    };
+    setRecentStudioOperations((prev) => [...prev, entry].slice(-30));
+    if (!sessionId) return;
+    apiClient.recordOperation(sessionId, operation).catch(() => {});
+  }, [sessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!sessionId) {
+      setRecentStudioOperations([]);
+      return undefined;
+    }
+    apiClient.listOperations(sessionId, 30)
+      .then((ops) => {
+        if (!cancelled) setRecentStudioOperations(Array.isArray(ops) ? ops : []);
+      })
+      .catch(() => {
+        if (!cancelled) setRecentStudioOperations([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  const selectedRegion = selClip && region?.clipId === selClip.id ? region : null;
+
+  const deleteSelectedClipOrRegion = useCallback((source = 'manual') => {
+    if (!selClip || !selTrack) return;
+    if (selectedRegion) {
+      const removed = removeRegion(selTrack.id, selClip.id, selectedRegion.a, selectedRegion.b);
+      if (!removed) {
+        setStatus('No selected region to delete.');
+        return;
+      }
+      recordStudioOperation({
+        source,
+        type: 'delete_region',
+        message: '',
+        actions: [],
+        result: {
+          track_id: selTrack.id,
+          clip_id: selClip.id,
+          start: selectedRegion.a,
+          end: selectedRegion.b,
+        },
+      });
+      setSelected(null);
+      setRegion(null);
+      return;
+    }
+
+    removeClip(selTrack.id, selClip.id);
+    recordStudioOperation({
+      source,
+      type: 'delete_clip',
+      message: '',
+      actions: [],
+      result: { track_id: selTrack.id, clip_id: selClip.id },
+    });
+    setSelected(null);
+    setRegion(null);
+  }, [selClip, selTrack, selectedRegion, removeRegion, removeClip, recordStudioOperation]);
+
+  const duplicateSelectedClipOrRegion = useCallback((source = 'manual') => {
+    if (!selClip || !selTrack) return;
+    if (selectedRegion) {
+      const newId = duplicateRegion(selTrack.id, selClip.id, selectedRegion.a, selectedRegion.b);
+      if (newId) setSelected({ trackId: selTrack.id, clipId: newId });
+      recordStudioOperation({
+        source,
+        type: 'duplicate_region',
+        message: '',
+        actions: [],
+        result: {
+          track_id: selTrack.id,
+          source_clip_id: selClip.id,
+          clip_id: newId,
+          start: selectedRegion.a,
+          end: selectedRegion.b,
+        },
+      });
+      setRegion(null);
+      return;
+    }
+
+    duplicateClip(selTrack.id, selClip.id);
+    recordStudioOperation({
+      source,
+      type: 'duplicate_clip',
+      message: '',
+      actions: [],
+      result: { track_id: selTrack.id, clip_id: selClip.id },
+    });
+  }, [selClip, selTrack, selectedRegion, duplicateRegion, duplicateClip, recordStudioOperation]);
 
   // --- keyboard shortcuts ------------------------------------------------
   useEffect(() => {
@@ -136,15 +244,11 @@ export default function Studio({
         e.preventDefault();
         playing ? pause() : play();
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selClip && selTrack) {
-          removeClip(selTrack.id, selClip.id);
-          setSelected(null);
-          setRegion(null);
-        }
+        deleteSelectedClipOrRegion();
       } else if (e.key === 's' || e.key === 'S') {
         if (selClip && selTrack) splitClip(selTrack.id, selClip.id, position);
       } else if (e.key === 'd' || e.key === 'D') {
-        if (selClip && selTrack) duplicateClip(selTrack.id, selClip.id);
+        duplicateSelectedClipOrRegion();
       } else if (e.key === 'Escape') {
         setRegion(null);
       } else if (e.key === '+' || e.key === '=') {
@@ -157,8 +261,25 @@ export default function Studio({
     return () => window.removeEventListener('keydown', onKey);
   }, [
     playing, pause, play, selClip, selTrack, midiEditorOpen,
-    removeClip, splitClip, duplicateClip, position, undo, redo,
+    splitClip, position, undo, redo, deleteSelectedClipOrRegion, duplicateSelectedClipOrRegion,
   ]);
+
+  useEffect(() => {
+    if (!selected) {
+      if (region) setRegion(null);
+      return;
+    }
+    const track = tracks.find((t) => t.id === selected.trackId);
+    const clip = track?.clips.find((c) => c.id === selected.clipId);
+    if (!track || !clip) {
+      setSelected(null);
+      setRegion(null);
+      return;
+    }
+    if (region && region.clipId !== selected.clipId) {
+      setRegion(null);
+    }
+  }, [tracks, selected, region]);
 
   // Ctrl/Cmd + wheel to zoom around the cursor.
   const onWheel = (e) => {
@@ -198,6 +319,7 @@ export default function Studio({
         backendUsed: result.backend_used,
         duration: result.duration || buffer.duration,
         startBar: selClip.startBar || 0,
+        audioUrl: result.audio_url,
       });
     } catch (e) {
       setStatus(`Failed — ${e.message}`);
@@ -231,6 +353,7 @@ export default function Studio({
         backendUsed: result.backend_used,
         duration: result.duration || buffer.duration,
         startBar,
+        audioUrl: result.audio_url,
       });
       setRegion(null);
     } catch (e) {
@@ -245,7 +368,18 @@ export default function Studio({
   const onRecorded = async (blob) => {
     const buffer = await context().decodeAudioData(await blob.arrayBuffer());
     const n = tracks.filter((t) => t.kind === 'audio').length + 1;
-    addTrackWithClip(`Audio ${n}`, 'audio', buffer, { start: snap(position) });
+    let upload = null;
+    try {
+      const { audioBufferToWav } = await import('../wav.js');
+      upload = await onUploadAudio?.(audioBufferToWav(buffer), `recording-${n}`);
+    } catch {
+      upload = null;
+    }
+    addTrackWithClip(`Audio ${n}`, 'audio', buffer, {
+      start: snap(position),
+      duration: upload?.duration || buffer.duration,
+      audioUrl: upload?.audio_url || null,
+    });
   };
 
   // Import an audio file straight onto the timeline as a new clip.
@@ -254,7 +388,18 @@ export default function Studio({
     try {
       const buffer = await context().decodeAudioData(await file.arrayBuffer());
       const name = file.name.replace(/\.[^.]+$/, '');
-      addTrackWithClip(name || 'Import', 'audio', buffer, { start: snap(position) });
+      let upload = null;
+      try {
+        const { audioBufferToWav } = await import('../wav.js');
+        upload = await onUploadAudio?.(audioBufferToWav(buffer), name || 'import');
+      } catch {
+        upload = null;
+      }
+      addTrackWithClip(name || 'Import', 'audio', buffer, {
+        start: snap(position),
+        duration: upload?.duration || buffer.duration,
+        audioUrl: upload?.audio_url || null,
+      });
     } catch (e) {
       setStatus(`Import failed — ${e.message}`);
     }
@@ -264,21 +409,7 @@ export default function Studio({
   const trimClip = (trackId, clip, side, t) => {
     const buf = getBuffer(clip.id);
     const bufDur = buf ? buf.duration : clip.offset + clip.duration;
-    if (side === 'left') {
-      const minStart = clip.start - clip.offset; // offset can't go below 0
-      const maxStart = clip.start + clip.duration - MIN_CLIP;
-      const newStart = Math.max(minStart, Math.min(t, maxStart));
-      const delta = newStart - clip.start;
-      updateClip(trackId, clip.id, {
-        start: newStart,
-        offset: clip.offset + delta,
-        duration: clip.duration - delta,
-      });
-    } else {
-      const maxEnd = clip.start + (bufDur - clip.offset);
-      const newEnd = Math.max(clip.start + MIN_CLIP, Math.min(t, maxEnd));
-      updateClip(trackId, clip.id, { duration: newEnd - clip.start });
-    }
+    updateClip(trackId, clip.id, trimClipPatch(clip, side, t, bufDur, MIN_CLIP));
   };
 
   // Render a track's audio to a WAV blob, to post as a generation reference.
@@ -322,143 +453,619 @@ export default function Studio({
     setBusy(false);
   };
 
-  // Agentic bar: interpret the request, then generate each part in turn.
-  const runRequest = async (text, mode = 'stems') => {
+  const buildStudioContext = () => ({
+    bpm,
+    key: keyName,
+    mode,
+    backend,
+    seconds_per_bar: secondsPerBar,
+    bar_numbering: '1-based; bar 1 starts at 0 seconds',
+    playhead: position,
+    duration,
+    selected_track_id: selected?.trackId ?? null,
+    selected_clip_id: selected?.clipId ?? null,
+    selected_region:
+      region && selected?.clipId === region.clipId
+        ? {
+            start: region.a,
+            end: region.b,
+            barStart: Math.round((region.a / secondsPerBar) * 4) / 4,
+            barEnd: Math.round((region.b / secondsPerBar) * 4) / 4,
+            bar_start_number: Math.floor(region.a / secondsPerBar) + 1,
+            bar_end_number: Math.ceil(region.b / secondsPerBar),
+            bar_start_position: Math.round((region.a / secondsPerBar + 1) * 4) / 4,
+            bar_end_position: Math.round((region.b / secondsPerBar) * 4) / 4,
+          }
+        : null,
+    tracks: tracks.map((track) => ({
+      id: track.id,
+      name: track.name,
+      kind: track.kind,
+      muted: track.muted,
+      soloed: track.soloed,
+      volume: track.volume,
+      clips: track.clips.map((clip) => ({
+        id: clip.id,
+        start: clip.start,
+        end: clip.start + clip.duration,
+        duration: clip.duration,
+        offset: clip.offset,
+        startBar: clip.startBar ?? 0,
+        barStart: Math.round((clip.start / secondsPerBar) * 4) / 4,
+        barEnd: Math.round(((clip.start + clip.duration) / secondsPerBar) * 4) / 4,
+        bar_start_number: Math.floor(clip.start / secondsPerBar) + 1,
+        bar_end_number: Math.ceil((clip.start + clip.duration) / secondsPerBar),
+        bar_start_position: Math.round((clip.start / secondsPerBar + 1) * 4) / 4,
+        bar_end_position: Math.round(((clip.start + clip.duration) / secondsPerBar) * 4) / 4,
+        part: clip.part,
+        prompt: clip.prompt,
+        seed: clip.seed,
+        backendUsed: clip.backendUsed,
+      })),
+    })),
+    recent_actions: recentStudioOperations,
+  });
+
+  const normalizeClipRegion = (clip, range, options = {}) => {
+    if (!clip) throw new Error('Select a clip first');
+    const clipStart = clip.start;
+    const clipEnd = clip.start + clip.duration;
+    let start = Number(range?.start);
+    let end = Number(range?.end);
+
+    if ((!Number.isFinite(start) || !Number.isFinite(end) || start === end) && options.fallbackLastBars) {
+      end = clipEnd;
+      start = clipEnd - options.fallbackLastBars * secondsPerBar;
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      throw new Error('Select a non-empty clip region first');
+    }
+
+    const from = Math.max(clipStart, Math.min(start, end));
+    const to = Math.min(clipEnd, Math.max(start, end));
+    const snappedStart = Math.max(clipStart, Math.min(clipEnd, snapQuarterBar(from)));
+    const snappedEnd = Math.max(clipStart, Math.min(clipEnd, snapQuarterBar(to)));
+    if (snappedEnd - snappedStart < MIN_CLIP) {
+      throw new Error('Selected region does not overlap the clip');
+    }
+    return { start: snappedStart, end: snappedEnd, duration: snappedEnd - snappedStart };
+  };
+
+  const clipRegionToWav = async (clip, range, options = {}) => {
+    const buffer = getBuffer(clip.id);
+    if (!buffer) throw new Error('Selected clip has no audio loaded');
+    const { audioBufferToWav } = await import('../wav.js');
+    const normalized = normalizeClipRegion(clip, range, options);
+    return audioBufferToWav(
+      buffer,
+      clip.offset + (normalized.start - clip.start),
+      normalized.duration,
+    );
+  };
+
+  const resolveActionTargetStart = (action) => {
+    if (Number.isFinite(Number(action.target_start))) {
+      return Math.max(0, Number(action.target_start));
+    }
+    if (Number.isFinite(Number(action.target_bar))) {
+      return Math.max(0, (Number(action.target_bar) - 1) * secondsPerBar);
+    }
+    throw new Error('No target time or bar provided');
+  };
+
+  const executeAgentAction = async (action, index, total) => {
+    const targetTrack = action.track_id ? tracks.find((t) => t.id === action.track_id) : selTrack;
+    const targetClip = targetTrack && action.clip_id
+      ? targetTrack.clips.find((c) => c.id === action.clip_id)
+      : action.track_id
+        ? targetTrack?.clips[targetTrack.clips.length - 1]
+        : selClip;
+
+    if (action.type !== 'set_tempo_key' && (action.bpm || action.key || action.mode)) {
+      setStatus('Setting tempo and key…');
+      await onApplySettings({ bpm: action.bpm, key: action.key, mode: action.mode });
+    }
+
+    if (action.type === 'ask_clarification') {
+      setStatus(action.reason || 'Select a clip or region first.');
+      return;
+    }
+
+    if (action.type === 'set_tempo_key') {
+      setStatus('Setting tempo and key…');
+      await onApplySettings({ bpm: action.bpm, key: action.key, mode: action.mode });
+      return;
+    }
+
+    if (action.type === 'split_clip') {
+      if (!targetTrack || !targetClip) throw new Error('No clip selected to split');
+      setStatus('Splitting clip…');
+      splitClip(targetTrack.id, targetClip.id, position);
+      recordStudioOperation({
+        source: 'agent',
+        type: 'split_clip',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: targetClip.id, at: position },
+      });
+      return;
+    }
+
+    if (action.type === 'move_clip') {
+      if (!targetTrack || !targetClip) throw new Error('No clip selected to move');
+      const targetStart = snapQuarterBar(resolveActionTargetStart(action));
+      if (action.region) {
+        const { start, end } = normalizeClipRegion(targetClip, action.region);
+        setStatus('Moving selected region…');
+        const newId = extractRegion(targetTrack.id, targetClip.id, start, end);
+        moveClip(targetTrack.id, newId, targetStart);
+        setSelected({ trackId: targetTrack.id, clipId: newId });
+        setRegion(null);
+        recordStudioOperation({
+          source: 'agent',
+          type: 'move_region',
+          message: action.reason || '',
+          actions: [action],
+          result: { track_id: targetTrack.id, source_clip_id: targetClip.id, clip_id: newId, start, end, target_start: targetStart },
+        });
+        return;
+      }
+      setStatus('Moving clip…');
+      patchClip(targetTrack.id, targetClip.id, { start: targetStart });
+      recordStudioOperation({
+        source: 'agent',
+        type: 'move_clip',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: targetClip.id, target_start: targetStart },
+      });
+      return;
+    }
+
+    if (action.type === 'duplicate_clip') {
+      if (!targetTrack || !targetClip) throw new Error('No clip selected to duplicate');
+      if (action.region) {
+        const { start, end } = normalizeClipRegion(targetClip, action.region);
+        setStatus('Duplicating region…');
+        const newId = duplicateRegion(targetTrack.id, targetClip.id, start, end);
+        setSelected({ trackId: targetTrack.id, clipId: newId });
+        setRegion(null);
+        recordStudioOperation({
+          source: 'agent',
+          type: 'duplicate_region',
+          message: action.reason || '',
+          actions: [action],
+          result: { track_id: targetTrack.id, source_clip_id: targetClip.id, clip_id: newId, start, end },
+        });
+        return;
+      }
+      setStatus('Duplicating clip…');
+      duplicateClip(targetTrack.id, targetClip.id);
+      recordStudioOperation({
+        source: 'agent',
+        type: 'duplicate_clip',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: targetClip.id },
+      });
+      return;
+    }
+
+    if (action.type === 'delete_clip') {
+      if (!targetTrack || !targetClip) throw new Error('No clip selected to delete');
+      if (action.region) {
+        const { start, end } = normalizeClipRegion(targetClip, action.region);
+        setStatus('Deleting region…');
+        const removed = removeRegion(targetTrack.id, targetClip.id, start, end);
+        if (!removed) throw new Error('Selected region could not be deleted');
+        setSelected(null);
+        setRegion(null);
+        recordStudioOperation({
+          source: 'agent',
+          type: 'delete_region',
+          message: action.reason || '',
+          actions: [action],
+          result: { track_id: targetTrack.id, clip_id: targetClip.id, start, end },
+        });
+        return;
+      }
+      setStatus('Deleting clip…');
+      removeClip(targetTrack.id, targetClip.id);
+      setSelected(null);
+      setRegion(null);
+      recordStudioOperation({
+        source: 'agent',
+        type: 'delete_clip',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: targetClip.id },
+      });
+      return;
+    }
+
+    if (action.type === 'delete_track') {
+      if (!targetTrack) throw new Error('No track selected to delete');
+      setStatus('Deleting track…');
+      removeTrack(targetTrack.id);
+      if (selected?.trackId === targetTrack.id) {
+        setSelected(null);
+        setRegion(null);
+      }
+      recordStudioOperation({
+        source: 'agent',
+        type: 'delete_track',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, name: targetTrack.name },
+      });
+      return;
+    }
+
+    if (action.type === 'extract_region') {
+      if (!targetTrack || !targetClip || !action.region) throw new Error('Select a clip region first');
+      const { start, end } = normalizeClipRegion(targetClip, action.region);
+      setStatus('Extracting region…');
+      const newId = extractRegion(targetTrack.id, targetClip.id, start, end);
+      setSelected({ trackId: targetTrack.id, clipId: newId });
+      setRegion(null);
+      recordStudioOperation({
+        source: 'agent',
+        type: 'extract_region',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, source_clip_id: targetClip.id, clip_id: newId, start, end },
+      });
+      return;
+    }
+
+    if (action.type === 'crop_to_region') {
+      if (!targetTrack || !targetClip || !action.region) throw new Error('Select a clip region first');
+      const { start, end } = normalizeClipRegion(targetClip, action.region);
+      setStatus('Cropping clip…');
+      patchClip(targetTrack.id, targetClip.id, {
+        start,
+        offset: targetClip.offset + (start - targetClip.start),
+        duration: end - start,
+      });
+      setRegion(null);
+      recordStudioOperation({
+        source: 'agent',
+        type: 'crop_to_region',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: targetClip.id, start, end },
+      });
+      return;
+    }
+
+    if (action.type === 'fill_region') {
+      if (!targetTrack || !action.region) throw new Error('Select a track and bar range to fill');
+      const start = snapQuarterBar(Number(action.region.start));
+      const end = snapQuarterBar(Number(action.region.end));
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end - start < MIN_CLIP) {
+        throw new Error('Choose a non-empty bar range to fill');
+      }
+      const regionDuration = end - start;
+      const quarterBars = Math.max(1, Math.round(regionDuration / quarterBarSec));
+      const barsInSection = Math.max(1, Math.ceil(quarterBars / 4));
+      const startBar = Math.max(0, Math.floor(start / secondsPerBar));
+      const prompt = action.style || action.prompt || targetTrack.clips[targetTrack.clips.length - 1]?.prompt || `fill ${targetTrack.name}`;
+      setStatus(`Filling ${targetTrack.name} (${index + 1}/${total})…`);
+      const result = await onGenerateStem({
+        part: targetTrack.kind,
+        style: prompt,
+        noise: action.noise,
+        bars: barsInSection,
+        start_bar: startBar,
+        seed: Math.floor(Math.random() * 1e9),
+      });
+      const buffer = await decodeResult(result);
+      const newClipId = addClip(targetTrack.id, buffer, {
+        start,
+        duration: regionDuration,
+        part: targetTrack.kind,
+        prompt,
+        seed: result.seed,
+        backendUsed: result.backend_used,
+        audioUrl: result.audio_url,
+        startBar,
+      });
+      setSelected({ trackId: targetTrack.id, clipId: newClipId });
+      setRegion(null);
+      recordStudioOperation({
+        source: 'agent',
+        type: 'fill_region',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: newClipId, start, end, audio_url: result.audio_url },
+      });
+      return;
+    }
+
+    if (action.type === 'regen_clip') {
+      if (!targetTrack || !targetClip) throw new Error('No clip selected to regenerate');
+      const bars = action.bars || Math.max(1, Math.round(targetClip.duration / secondsPerBar));
+      setStatus(`Regenerating ${targetTrack.name}…`);
+      const result = await onGenerateStem({
+        part: targetTrack.kind,
+        style: action.style || action.prompt || targetClip.prompt,
+        noise: action.noise,
+        bars,
+        start_bar: targetClip.startBar || 0,
+        seed: Math.floor(Math.random() * 1e9),
+      });
+      const buffer = await decodeResult(result);
+      replaceRegion(targetTrack.id, targetClip.id, targetClip.start, targetClip.start + targetClip.duration, buffer, {
+        prompt: action.style || action.prompt || targetClip.prompt,
+        seed: result.seed,
+        backendUsed: result.backend_used,
+        duration: result.duration || buffer.duration,
+        startBar: targetClip.startBar || 0,
+        audioUrl: result.audio_url,
+      });
+      recordStudioOperation({
+        source: 'agent',
+        type: 'regen_clip',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: targetClip.id, audio_url: result.audio_url },
+      });
+      return;
+    }
+
+    if (action.type === 'regen_region') {
+      if (!targetTrack || !targetClip || !action.region) throw new Error('Select a clip region first');
+      const { start, end, duration: regionDuration } = normalizeClipRegion(targetClip, action.region);
+      const quarterBars = Math.max(1, Math.round(regionDuration / quarterBarSec));
+      const barsInSection = Math.max(1, Math.ceil(quarterBars / 4));
+      const startBar = (targetClip.startBar || 0) + Math.floor((start - targetClip.start) / secondsPerBar);
+      setStatus(`Regenerating selected region (${index + 1}/${total})…`);
+      const result = await onGenerateStem({
+        part: targetTrack.kind,
+        style: action.style || action.prompt || targetClip.prompt,
+        noise: action.noise,
+        bars: barsInSection,
+        start_bar: startBar,
+        seed: Math.floor(Math.random() * 1e9),
+      });
+      const buffer = await decodeResult(result);
+      replaceRegion(targetTrack.id, targetClip.id, start, end, buffer, {
+        prompt: action.style || action.prompt || targetClip.prompt,
+        seed: result.seed,
+        backendUsed: result.backend_used,
+        duration: regionDuration,
+        startBar,
+        audioUrl: result.audio_url,
+      });
+      setRegion(null);
+      recordStudioOperation({
+        source: 'agent',
+        type: 'regen_region',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: targetClip.id, start, end, audio_url: result.audio_url },
+      });
+      return;
+    }
+
+    if (action.type === 'sa3_edit_region') {
+      if (!targetTrack || !targetClip || !action.region) throw new Error('Select a clip region first');
+      const normalized = normalizeClipRegion(targetClip, action.region);
+      const prompt = action.prompt || action.style || `edit ${targetTrack.name}`;
+      setStatus(`Editing selected audio with SA3 (${index + 1}/${total})…`);
+      const wav = await clipRegionToWav(targetClip, normalized);
+      const result = await onGenerateFromReference({
+        referenceWav: wav,
+        prompt,
+        noise: action.noise ?? 0.75,
+        name: `${targetTrack.name}-edit`,
+        seed: Math.floor(Math.random() * 1e9),
+      });
+      const buffer = await decodeResult(result);
+      replaceRegion(targetTrack.id, targetClip.id, normalized.start, normalized.end, buffer, {
+        prompt,
+        seed: result.seed,
+        backendUsed: result.backend_used,
+        duration: normalized.duration,
+        audioUrl: result.audio_url,
+      });
+      setRegion(null);
+      recordStudioOperation({
+        source: 'agent',
+        type: 'sa3_edit_region',
+        message: action.reason || '',
+        actions: [action],
+        result: { track_id: targetTrack.id, clip_id: targetClip.id, start: normalized.start, end: normalized.end, audio_url: result.audio_url },
+      });
+      return;
+    }
+
+    if (action.type === 'extend_clip') {
+      if (!targetTrack || !targetClip) throw new Error('No clip selected to extend');
+      const bars = action.bars || 4;
+      const reference = normalizeClipRegion(targetClip, null, { fallbackLastBars: bars });
+      const prompt = action.prompt || action.style || `continue ${targetTrack.name} naturally`;
+      setStatus(`Extending ${targetTrack.name} (${index + 1}/${total})…`);
+      const wav = await clipRegionToWav(targetClip, reference);
+      const result = await onGenerateFromReference({
+        referenceWav: wav,
+        prompt,
+        noise: action.noise ?? 0.7,
+        name: `${targetTrack.name}-extension`,
+        seed: Math.floor(Math.random() * 1e9),
+      });
+      const buffer = await decodeResult(result);
+      const newClipId = addClip(targetTrack.id, buffer, {
+        start: targetClip.start + targetClip.duration,
+        duration: result.duration || buffer.duration,
+        part: targetClip.part || targetTrack.kind,
+        prompt,
+        seed: result.seed,
+        backendUsed: result.backend_used,
+        audioUrl: result.audio_url,
+        startBar: (targetClip.startBar || 0) + Math.round(targetClip.duration / secondsPerBar),
+      });
+      setSelected({ trackId: targetTrack.id, clipId: newClipId });
+      recordStudioOperation({
+        source: 'agent',
+        type: 'extend_clip',
+        message: action.reason || '',
+        actions: [action],
+        result: {
+          track_id: targetTrack.id,
+          source_clip_id: targetClip.id,
+          clip_id: newClipId,
+          reference_start: reference.start,
+          reference_end: reference.end,
+          audio_url: result.audio_url,
+        },
+      });
+      return;
+    }
+
+    if (action.type === 'compose_midi') {
+      const label = action.name || action.part || 'MIDI';
+      setStatus(`Writing ${label} (${index + 1}/${total})…`);
+      await onComposeMidi({
+        text: [action.name, action.instrument, action.style, action.prompt].filter(Boolean).join(', '),
+        bars: action.bars || undefined,
+        style: action.style || undefined,
+      });
+      return;
+    }
+
+    if (action.type === 'generate_track') {
+      const part = action.part || 'free';
+      const label = action.name || part;
+      setStatus(`Generating ${label} (${index + 1}/${total})…`);
+      const result = await onGenerateStem({
+        part,
+        style: action.style || action.prompt || undefined,
+        name: action.name,
+        instrument: action.instrument,
+        production: action.production || undefined,
+        bars: action.bars || undefined,
+        voice_index: action.voice_index || 0,
+        voice_count: action.voice_count || 1,
+      });
+      const buffer = await decodeResult(result);
+      addTrackWithClip(label[0].toUpperCase() + label.slice(1), part, buffer, {
+        audioUrl: result.audio_url,
+        start: 0,
+        part,
+        prompt: action.style || action.prompt,
+        seed: result.seed,
+        backendUsed: result.backend_used,
+        duration: result.duration || buffer.duration,
+      });
+      recordStudioOperation({
+        source: 'agent',
+        type: 'generate_track',
+        message: action.reason || '',
+        actions: [action],
+        result: { name: action.name, part, audio_url: result.audio_url },
+      });
+      return;
+    }
+
+    throw new Error(`Unsupported agent action: ${action.type}`);
+  };
+
+  // Agentic bar: plan Studio actions, then execute them through the same
+  // functions manual UI controls use.
+  const runRequest = async (text) => {
     setBusy(true);
-    setStatus('Interpreting…');
+    setStatus('Planning…');
 
     let plan;
     try {
-      plan = await apiClient.interpret(text, sessionId, mode);
+      plan = await apiClient.planAgentActions({
+        message: text,
+        sessionId,
+        studioContext: buildStudioContext(),
+      });
     } catch (e) {
-      setStatus(`Could not interpret — ${e.message}`);
+      setStatus(`Could not plan — ${e.message}`);
       setBusy(false);
       return;
     }
 
-    if (!plan.tracks.length) {
-      setStatus(plan.notes || 'No instruments recognised — try "bass, drums and piano".');
+    if (!plan.actions?.length) {
+      setStatus(plan.notes || 'No action recognised.');
       setBusy(false);
       return;
     }
-
-    // Tempo, key and mode are part of the request too — explicitly ("90 BPM in
-    // D minor") or through mood alone ("something slow and sad"). They are
-    // applied before generating, and saved to the session, or the guide tracks
-    // are built on the old grid and every stem lands in the wrong key.
-    if (plan.bpm || plan.key || plan.mode) {
-      setStatus('Setting tempo and key…');
-      await onApplySettings({ bpm: plan.bpm, key: plan.key, mode: plan.mode });
-    }
-
-    // Who trades with whom. The backend arranges each part around the others
-    // — leads take turns, comping parts lay out — but only if it knows which
-    // of several same-role tracks this one is. Roles have to match the
-    // backend's ROLES table.
-    const ROLE = {
-      drums: 'rhythm', bass: 'rhythm', mix: 'rhythm',
-      piano: 'comp', guitar: 'comp', harmony: 'comp',
-      melody: 'lead', free: 'lead',
-    };
-    // Generate the rhythm section first, then comping, then leads. Each part
-    // is generated against the stems already made, so the order decides what
-    // the context IS: a lead cut against drums and bass locks to a groove,
-    // a lead cut first is cut against nothing and everything after has to
-    // live with whatever feel it invented.
-    const ROLE_ORDER = { rhythm: 0, comp: 1, lead: 2 };
-    plan.tracks.sort(
-      (a, b) => (ROLE_ORDER[ROLE[a.part]] ?? 2) - (ROLE_ORDER[ROLE[b.part]] ?? 2),
-    );
-    const roleCounts = {};
-    const voices = plan.tracks.map((spec) => {
-      const role = ROLE[spec.part] || 'lead';
-      const index = roleCounts[role] || 0;
-      roleCounts[role] = index + 1;
-      return { role, index };
-    });
-    const roleTotals = roleCounts;
-
-    // Nothing to cohere with when the user asked for a single track: the
-    // ensemble bed exists to make parts of one arrangement sit together,
-    // and mixing whatever is already in the session under a standalone
-    // request is how a drum track came back with someone else's guitar
-    // bleeding through it.
-    const ensemble = plan.tracks.length > 1 ? undefined : false;
 
     try {
-      // MIDI specs are written note by note; audio specs are generated.
-      const midiSpecs = plan.tracks.filter((s) => s.midi);
-      const audioSpecs = plan.tracks.filter((s) => !s.midi);
-
-      for (const [i, spec] of midiSpecs.entries()) {
-        const label = spec.name || spec.part;
-        setStatus(`Writing ${label} (${i + 1}/${midiSpecs.length})…`);
-        await onComposeMidi({
-          text: [spec.name, spec.instrument, spec.style, plan.style]
-            .filter(Boolean)
-            .join(', '),
-          bars: plan.bars || undefined,
-          style: [plan.style, spec.style].filter(Boolean).join(', ') || undefined,
-        });
-      }
-
-      const addStem = async (result, part, label, style) => {
-        const buffer = await decodeResult(result);
-        addTrackWithClip(label[0].toUpperCase() + label.slice(1), part, buffer, {
-          audioUrl: result.audio_url,
-          start: 0,
-          part,
-          prompt: style,
-          seed: result.seed,
-          backendUsed: result.backend_used,
-          duration: result.duration || buffer.duration,
-        });
+      const ROLE = {
+        drums: 'rhythm', bass: 'rhythm', mix: 'rhythm',
+        piano: 'comp', guitar: 'comp', harmony: 'comp',
+        melody: 'lead', free: 'lead',
       };
+      const roleCounts = {};
+      const actions = plan.actions.map((action) => {
+        if (action.type !== 'generate_track') return action;
+        const role = ROLE[action.part] || 'lead';
+        const voice_index = roleCounts[role] || 0;
+        roleCounts[role] = voice_index + 1;
+        return { ...action, voice_index };
+      }).map((action) => (
+        action.type === 'generate_track'
+          ? { ...action, voice_count: roleCounts[ROLE[action.part] || 'lead'] || 1 }
+          : action
+      ));
 
-      if (audioSpecs.length > 1) {
-        // Master-first: the whole band is rendered as ONE record, then each
-        // stem is carved out of that master. Generating the parts as separate
-        // model calls — however much shared text and context they got — gave
-        // N performances that merely agreed on a key, and stacking them
-        // sounded exactly like that.
-        setStatus(`Recording the band (${audioSpecs.length} parts)…`);
+      const generateActions = actions.filter((action) => action.type === 'generate_track');
+      const otherActions = actions.filter((action) => action.type !== 'generate_track');
+
+      if (generateActions.length > 1 && onGenerateSong) {
+        setStatus(`Recording the band (${generateActions.length} parts)…`);
         const stems = await onGenerateSong({
           onProgress: setStatus,
-          // The words the user actually typed — they lead the master prompt.
-          description: text,
-          tracks: audioSpecs.map((spec, i) => ({
-            part: spec.part,
-            name: spec.name,
-            instrument: spec.instrument,
-            voice_index: voices[plan.tracks.indexOf(spec)].index,
-            voice_count: roleTotals[voices[plan.tracks.indexOf(spec)].role] || 1,
+          tracks: generateActions.map((action) => ({
+            part: action.part || 'free',
+            name: action.name,
+            instrument: action.instrument,
+            voice_index: action.voice_index || 0,
+            voice_count: action.voice_count || 1,
           })),
-          style: plan.style || undefined,
-          production: plan.production || undefined,
-          bars: plan.bars || undefined,
+          style: generateActions
+            .map((action) => action.style || action.prompt)
+            .filter(Boolean)
+            .join(', ') || undefined,
+          production: generateActions.find((action) => action.production)?.production || undefined,
+          bars: Math.max(...generateActions.map((action) => action.bars || 0)) || undefined,
+          description: text,
         });
         for (const stem of stems) {
-          await addStem(stem, stem.part, stem.name || stem.part, plan.style);
+          const buffer = await decodeResult(stem);
+          const part = stem.part || 'free';
+          const label = stem.name || part;
+          addTrackWithClip(label[0].toUpperCase() + label.slice(1), part, buffer, {
+            audioUrl: stem.audio_url,
+            start: 0,
+            part,
+            prompt: stem.prompt || '',
+            seed: stem.seed,
+            backendUsed: stem.backend_used,
+            duration: stem.duration || buffer.duration,
+          });
+        }
+        for (const [i, action] of otherActions.entries()) {
+          await executeAgentAction(action, i, otherActions.length);
         }
       } else {
-        for (const spec of audioSpecs) {
-          const part = spec.part;
-          const label = spec.name || part;
-          const style = [plan.style, spec.style].filter(Boolean).join(', ') || undefined;
-          setStatus(`Generating ${label}…`);
-          const result = await onGenerateStem({
-            part,
-            style,
-            name: spec.name,
-            instrument: spec.instrument,
-            production: plan.production || undefined,
-            voice_index: voices[plan.tracks.indexOf(spec)].index,
-            voice_count: roleTotals[voices[plan.tracks.indexOf(spec)].role] || 1,
-            ensemble,
-          });
-          await addStem(result, part, label, style);
+        for (const [i, action] of actions.entries()) {
+          await executeAgentAction(action, i, actions.length);
         }
       }
+      recordStudioOperation({
+        source: 'agent',
+        type: 'agent_actions',
+        message: text,
+        actions,
+        result: { notes: plan.notes || '', interpreter: plan.interpreter || '' },
+      });
       setStatus(plan.notes || '');
     } catch (e) {
       setStatus(`Failed — ${e.message}`);
@@ -506,7 +1113,6 @@ export default function Studio({
         bars: Math.max(1, Math.round((selClip.durationBeats || 8) / 4)),
       });
       const buffer = await decodeResult(result);
-      beginGesture();
       attachBuffer(selTrack.id, selClip.id, buffer, {
         duration: result.duration || buffer.duration,
         seed: result.seed,
@@ -653,7 +1259,20 @@ export default function Studio({
               sampler={sampler}
               onLoadInstrument={(i) => loadInstrument(t, i)}
               onProp={(p, v) => setTrackProp(t.id, p, v)}
-              onRemove={() => removeTrack(t.id)}
+              onRemove={() => {
+                removeTrack(t.id);
+                recordStudioOperation({
+                  source: 'manual',
+                  type: 'delete_track',
+                  message: '',
+                  actions: [],
+                  result: { track_id: t.id, name: t.name },
+                });
+                if (selected?.trackId === t.id) {
+                  setSelected(null);
+                  setRegion(null);
+                }
+              }}
             />
           ))}
           {tracks.length === 0 && <div className="empty-h">no tracks</div>}
@@ -696,12 +1315,37 @@ export default function Studio({
                     setRegion(null);
                   }}
                   onMove={(clipId, s) => moveClip(t.id, clipId, s)}
+                  onMoveEnd={(clipId, from, to) => {
+                    recordStudioOperation({
+                      source: 'manual',
+                      type: 'move_clip',
+                      message: '',
+                      actions: [],
+                      result: { track_id: t.id, clip_id: clipId, from, to },
+                    });
+                  }}
                   onTrim={(clip, side, tt) => trimClip(t.id, clip, side, tt)}
+                  onTrimEnd={(clip, side, at) => {
+                    recordStudioOperation({
+                      source: 'manual',
+                      type: 'trim_clip',
+                      message: '',
+                      actions: [],
+                      result: { track_id: t.id, clip_id: clip.id, side, at },
+                    });
+                  }}
                   onBeginGesture={beginGesture}
                   onExtract={(clipId, a, b) => {
                     const newId = extractRegion(t.id, clipId, a, b);
                     setSelected({ trackId: t.id, clipId: newId });
                     setRegion(null);
+                    recordStudioOperation({
+                      source: 'manual',
+                      type: 'extract_region',
+                      message: '',
+                      actions: [],
+                      result: { track_id: t.id, source_clip_id: clipId, clip_id: newId, start: a, end: b },
+                    });
                     return newId;
                   }}
                   onMoveById={(clipId, s) => moveClip(t.id, clipId, s)}
@@ -751,12 +1395,21 @@ export default function Studio({
           buffer={getBuffer(selClip.id)}
           onRegenClip={regenClip}
           onRegenSection={regenSection}
-          onSplit={() => splitClip(selTrack.id, selClip.id, position)}
-          onDuplicate={() => duplicateClip(selTrack.id, selClip.id)}
+          onSplit={() => {
+            splitClip(selTrack.id, selClip.id, position);
+            recordStudioOperation({
+              source: 'manual',
+              type: 'split_clip',
+              message: '',
+              actions: [],
+              result: { track_id: selTrack.id, clip_id: selClip.id, at: position },
+            });
+          }}
+          onDuplicate={() => {
+            duplicateSelectedClipOrRegion();
+          }}
           onDelete={() => {
-            removeClip(selTrack.id, selClip.id);
-            setSelected(null);
-            setRegion(null);
+            deleteSelectedClipOrRegion();
           }}
         />
       )}
@@ -772,44 +1425,16 @@ export default function Studio({
 // Describe an arrangement in words; parse it into parts + style and
 // generate each one. The plan is shown before you commit, because a
 // misread request costs a minute of generation.
-//
-// The mode is picked, not inferred. "Give me a drum backing track" is one
-// stem to a musician and a whole arrangement to a model reading the word
-// "track", and there is no phrasing that reliably separates the two — so
-// the user says which they want and the agent is told, not asked.
-const MODES = [
-  { id: 'stems', label: 'Separate tracks', hint: 'One generated track per instrument' },
-  { id: 'single', label: 'One track', hint: 'The whole band rendered as a single track' },
-  { id: 'midi', label: 'MIDI', hint: 'Editable notes in the piano roll, not audio' },
-];
-
 function AskBar({ busy, onRun, status }) {
   const [text, setText] = useState('');
-  const [mode, setMode] = useState('stems');
 
   const submit = (e) => {
     e.preventDefault();
-    if (!busy && text.trim()) onRun(text, mode);
+    if (!busy && text.trim()) onRun(text);
   };
-
-  const selected = MODES.find((m) => m.id === mode);
 
   return (
     <form className="askbar" onSubmit={submit}>
-      <select
-        className="ask-mode"
-        value={mode}
-        onChange={(e) => setMode(e.target.value)}
-        disabled={busy}
-        title={selected?.hint}
-        aria-label="What to generate"
-      >
-        {MODES.map((m) => (
-          <option key={m.id} value={m.id} title={m.hint}>
-            {m.label}
-          </option>
-        ))}
-      </select>
       <input
         className="ask-input"
         placeholder="Describe what you want — “bass, drums and piano, bossa nova”"
@@ -821,7 +1446,7 @@ function AskBar({ busy, onRun, status }) {
         {busy ? '…' : 'Generate'}
       </button>
       <span className="ask-plan">
-        {status || (text.trim() ? selected?.hint : '')}
+        {status || (text.trim() ? 'Ask the agent to plan and generate tracks' : '')}
       </span>
     </form>
   );
@@ -968,7 +1593,9 @@ function Lane({
   onSeek,
   onSelect,
   onMove,
+  onMoveEnd,
   onTrim,
+  onTrimEnd,
   onBeginGesture,
   onExtract,
   onMoveById,
@@ -1003,12 +1630,12 @@ function Lane({
           selected={selectedClipId === c.id}
           region={region?.clipId === c.id ? region : null}
           onSelect={() => onSelect(c.id)}
-          onMove={(s) => {
-            onBeginGesture();
-            onMove(c.id, s);
-          }}
+          onBeginGesture={onBeginGesture}
+          onMove={(s) => onMove(c.id, s)}
+          onMoveEnd={(from, to) => onMoveEnd?.(c.id, from, to)}
           onMoveById={onMoveById}
           onTrim={(side, tt) => onTrim(c, side, tt)}
+          onTrimEnd={(side, tt) => onTrimEnd?.(c, side, tt)}
           onExtract={(a, b) => onExtract(c.id, a, b)}
           onRange={(a, b) => onRange(c.id, a, b)}
         />
@@ -1157,12 +1784,24 @@ function ClipInspector({
     });
   };
   const regionBars = region ? Math.max(1, Math.round((region.b - region.a) / secondsPerBar)) : 0;
+  const clipStartBar = Math.round((clip.start / secondsPerBar) * 4) / 4;
+  const clipEndBar = Math.round(((clip.start + clip.duration) / secondsPerBar) * 4) / 4;
+  const regionStartBar = region ? Math.round((region.a / secondsPerBar) * 4) / 4 : null;
+  const regionEndBar = region ? Math.round((region.b / secondsPerBar) * 4) / 4 : null;
 
   return (
     <div className="inspector">
       <div className="insp-title">
         <span className="dot" style={{ background: KIND_COLOR[track.kind] || '#c4d4d6' }} />
         {track.name}
+        <span className="insp-meta">
+          {fmt(clip.start)}-{fmt(clip.start + clip.duration)} · bars {clipStartBar}-{clipEndBar}
+        </span>
+        {region && (
+          <span className="insp-meta">
+            selection {fmt(region.a)}-{fmt(region.b)} · bars {regionStartBar}-{regionEndBar}
+          </span>
+        )}
         {clip.seed != null && <span className="insp-meta">seed {clip.seed}</span>}
         {clip.backendUsed && <span className="insp-meta">{clip.backendUsed}</span>}
       </div>
@@ -1202,7 +1841,7 @@ function ClipInspector({
           Split at playhead
         </button>
         <button className="i-btn" onClick={onDuplicate} title="D">
-          Duplicate
+          {region ? 'Duplicate region' : 'Duplicate clip'}
         </button>
         <button className="i-btn" onClick={download}>
           Download WAV
@@ -1211,7 +1850,7 @@ function ClipInspector({
           {shareLabel}
         </button>
         <button className="i-btn danger" onClick={onDelete} title="Delete/Backspace">
-          Delete clip
+          {region ? 'Delete region' : 'Delete clip'}
         </button>
       </div>
     </div>

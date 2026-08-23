@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from 'react';
+import * as apiClient from './api.js';
 
 // Keep the project across reloads.
 //
@@ -23,6 +24,94 @@ export function useProject({ engine, sessionId, setSessionId, studio, onRestored
   const restoredRef = useRef(false);
   const timerRef = useRef(null);
 
+  const snapshot = useCallback(() => ({
+    version: 1,
+    sessionId,
+    bpm: studio.bpm,
+    key: studio.key,
+    mode: studio.mode,
+    tracks: engine.tracks.map((t) => ({
+      name: t.name,
+      kind: t.kind,
+      instrument: t.instrument ?? null,
+      muted: t.muted,
+      soloed: t.soloed,
+      volume: t.volume,
+      clips: t.clips.map((c) => ({
+        start: c.start,
+        duration: c.duration,
+        durationBeats: c.durationBeats,
+        offset: c.offset,
+        notes: c.notes ?? null,
+        part: c.part ?? null,
+        prompt: c.prompt ?? '',
+        seed: c.seed ?? null,
+        backendUsed: c.backendUsed ?? null,
+        startBar: c.startBar ?? 0,
+        audioUrl: c.audioUrl ?? null,
+        midiUrl: c.midiUrl ?? null,
+      })),
+    })),
+  }), [engine.tracks, sessionId, studio.bpm, studio.key, studio.mode]);
+
+  const restoreSnapshot = useCallback(async (saved) => {
+    if (!saved?.tracks?.length) return false;
+
+    engine.clear();
+    if (saved.sessionId) setSessionId(saved.sessionId);
+    if (saved.bpm) studio.setBpm(saved.bpm);
+    if (saved.key) studio.setKey(saved.key);
+    if (saved.mode) studio.setMode(saved.mode);
+
+    for (const track of saved.tracks) {
+      if (track.kind === 'midi') {
+        const clip = track.clips?.[0];
+        if (!clip) continue;
+        engine.addMidiTrack(track.name, track.instrument, {
+          start: clip.start,
+          duration: clip.duration,
+          durationBeats: clip.durationBeats,
+          notes: clip.notes || [],
+          midiUrl: clip.midiUrl || null,
+          muted: track.muted,
+          soloed: track.soloed,
+          volume: track.volume,
+        });
+        continue;
+      }
+
+      const trackId = engine.addTrack(track.name, track.kind, {
+        instrument: track.instrument,
+        muted: track.muted,
+        soloed: track.soloed,
+        volume: track.volume,
+      });
+      for (const clip of track.clips || []) {
+        if (!clip.audioUrl) continue;
+        try {
+          const response = await fetch(clip.audioUrl);
+          if (!response.ok) continue;
+          const buffer = await engine.context().decodeAudioData(await response.arrayBuffer());
+          engine.addClip(trackId, buffer, {
+            start: clip.start,
+            duration: clip.duration,
+            offset: clip.offset,
+            part: clip.part,
+            prompt: clip.prompt,
+            seed: clip.seed,
+            backendUsed: clip.backendUsed,
+            startBar: clip.startBar,
+            audioUrl: clip.audioUrl,
+          });
+        } catch {
+          // A missing clip should not block the rest of the project.
+        }
+      }
+    }
+    onRestored?.(saved);
+    return true;
+  }, [engine, setSessionId, studio, onRestored]);
+
   // --- save --------------------------------------------------------------
 
   useEffect(() => {
@@ -32,43 +121,19 @@ export function useProject({ engine, sessionId, setSessionId, studio, onRestored
 
     clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => {
-      const snapshot = {
-        version: 1,
-        sessionId,
-        bpm: studio.bpm,
-        key: studio.key,
-        mode: studio.mode,
-        tracks: engine.tracks.map((t) => ({
-          name: t.name,
-          kind: t.kind,
-          instrument: t.instrument ?? null,
-          muted: t.muted,
-          soloed: t.soloed,
-          volume: t.volume,
-          clips: t.clips.map((c) => ({
-            start: c.start,
-            duration: c.duration,
-            durationBeats: c.durationBeats,
-            offset: c.offset,
-            notes: c.notes ?? null,
-            part: c.part ?? null,
-            prompt: c.prompt ?? '',
-            seed: c.seed ?? null,
-            backendUsed: c.backendUsed ?? null,
-            audioUrl: c.audioUrl ?? null,
-            midiUrl: c.midiUrl ?? null,
-          })),
-        })),
-      };
+      const current = snapshot();
       try {
-        localStorage.setItem(KEY, JSON.stringify(snapshot));
+        localStorage.setItem(KEY, JSON.stringify(current));
       } catch {
         // Quota, most likely. Losing autosave is not worth breaking the app.
+      }
+      if (sessionId) {
+        apiClient.saveTimeline(sessionId, current).catch(() => {});
       }
     }, SAVE_DEBOUNCE);
 
     return () => clearTimeout(timerRef.current);
-  }, [engine.tracks, sessionId, studio.bpm, studio.key, studio.mode]);
+  }, [snapshot, sessionId]);
 
   // --- restore -----------------------------------------------------------
 
@@ -86,52 +151,24 @@ export function useProject({ engine, sessionId, setSessionId, studio, onRestored
         saved = null;
       }
 
+      if (saved?.sessionId) {
+        try {
+          const timeline = await apiClient.getTimeline(saved.sessionId);
+          if (timeline?.tracks?.length) {
+            saved = { ...timeline, sessionId: saved.sessionId };
+          }
+        } catch {
+          // Backend session may have been deleted; local snapshot is fallback.
+        }
+      }
+
       if (!saved?.tracks?.length) {
         restoredRef.current = true;
         return;
       }
-
-      if (saved.sessionId) setSessionId(saved.sessionId);
-      if (saved.bpm) studio.setBpm(saved.bpm);
-      if (saved.key) studio.setKey(saved.key);
-      if (saved.mode) studio.setMode(saved.mode);
-
-      for (const track of saved.tracks) {
-        const clip = track.clips?.[0];
-        if (!clip) continue;
-
-        if (track.kind === 'midi') {
-          engine.addMidiTrack(track.name, track.instrument, {
-            start: clip.start,
-            duration: clip.duration,
-            durationBeats: clip.durationBeats,
-            notes: clip.notes || [],
-            midiUrl: clip.midiUrl || null,
-          });
-          continue;
-        }
-
-        if (!clip.audioUrl) continue;
-        try {
-          const response = await fetch(clip.audioUrl);
-          if (!response.ok) continue; // session cleaned up server-side
-          const buffer = await engine.context().decodeAudioData(await response.arrayBuffer());
-          engine.addTrackWithClip(track.name, track.kind, buffer, {
-            start: clip.start,
-            duration: clip.duration,
-            part: clip.part,
-            prompt: clip.prompt,
-            seed: clip.seed,
-            backendUsed: clip.backendUsed,
-            audioUrl: clip.audioUrl,
-          });
-        } catch {
-          // A stem that will not load should not stop the rest restoring.
-        }
-      }
+      await restoreSnapshot(saved);
 
       restoredRef.current = true;
-      onRestored?.(saved);
     })();
 
     // No cleanup: StrictMode's dev-only unmount/remount would cancel the
@@ -146,5 +183,5 @@ export function useProject({ engine, sessionId, setSessionId, studio, onRestored
     localStorage.removeItem(KEY);
   }, []);
 
-  return { clear };
+  return { clear, restore: restoreSnapshot };
 }

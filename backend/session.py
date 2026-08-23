@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -31,10 +32,21 @@ from .models import Analysis, Arrangement, StemResult
 from .melody import Note
 
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_META_LOCKS: dict[str, threading.Lock] = {}
+_META_LOCKS_GUARD = threading.Lock()
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _meta_lock(session_id: str) -> threading.Lock:
+    with _META_LOCKS_GUARD:
+        lock = _META_LOCKS.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _META_LOCKS[session_id] = lock
+        return lock
 
 
 @dataclass
@@ -51,7 +63,7 @@ class Session:
         session_id = uuid.uuid4().hex[:12]
         session = cls(id=session_id, root=SESSIONS_DIR / session_id)
 
-        for subdir in ("guides", "stems", "midi"):
+        for subdir in ("guides", "stems", "midi", "uploads"):
             (session.root / subdir).mkdir(parents=True, exist_ok=True)
 
         sf.write(session.vocal_path, vocal, sr)
@@ -92,6 +104,9 @@ class Session:
 
     def midi_path(self, track: str) -> Path:
         return self.root / "midi" / f"{track}.mid"
+
+    def upload_path(self, filename: str) -> Path:
+        return self.root / "uploads" / filename
 
     # --- audio ---------------------------------------------------------
 
@@ -150,11 +165,19 @@ class Session:
     # --- metadata ------------------------------------------------------
 
     def _read_meta(self) -> dict:
-        return json.loads(self.meta_path.read_text())
+        with _meta_lock(self.id):
+            text = self.meta_path.read_text()
+            if not text.strip():
+                raise ValueError(f"session {self.id} metadata is empty or corrupt")
+            return json.loads(text)
 
     def _write_meta(self, meta: dict) -> None:
         meta["updated_at"] = _now()
-        self.meta_path.write_text(json.dumps(meta, indent=2))
+        payload = json.dumps(meta, indent=2)
+        tmp = self.meta_path.with_suffix(".json.tmp")
+        with _meta_lock(self.id):
+            tmp.write_text(payload)
+            tmp.replace(self.meta_path)
 
     def set_display_name(self, name: str) -> None:
         meta = self._read_meta()
@@ -231,6 +254,35 @@ class Session:
         meta = self._read_meta()
         meta.setdefault("transforms", {})[name] = transform
         self._write_meta(meta)
+
+    @property
+    def timeline(self) -> dict | None:
+        return self._read_meta().get("timeline")
+
+    def save_timeline(self, timeline: dict) -> dict:
+        meta = self._read_meta()
+        meta["timeline"] = timeline
+        self._write_meta(meta)
+        return meta["timeline"]
+
+    def operations(self, limit: int = 100) -> list[dict]:
+        ops = self._read_meta().get("operations") or []
+        return ops[-limit:]
+
+    def record_operation(self, operation: dict) -> dict:
+        meta = self._read_meta()
+        ops = meta.setdefault("operations", [])
+        entry = {
+            "id": uuid.uuid4().hex[:12],
+            "created_at": _now(),
+            **operation,
+        }
+        ops.append(entry)
+        # Keep meta.json bounded; this is history for agent context, not an
+        # audit log that needs to grow forever.
+        meta["operations"] = ops[-200:]
+        self._write_meta(meta)
+        return entry
 
     def to_dict(self) -> dict:
         return self._read_meta()

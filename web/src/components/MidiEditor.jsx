@@ -136,9 +136,10 @@ export default function MidiEditor({
       const offset = (startedAt - startedAtRef.current) / 1000 / secondsPerBeat;
       const start = snapTo(originRef.current + Math.max(0, offset));
       const length = Math.max(snap, snapTo((endedAt - startedAt) / 1000 / secondsPerBeat));
+      onBeginEdit?.();
       onNotesChange([...notesRef.current, { id: uid(), pitch, velocity, start, length }]);
     },
-    [recording, secondsPerBeat, snap, onNotesChange],
+    [recording, secondsPerBeat, snap, onBeginEdit, onNotesChange],
   );
 
   const { devices, active, error, panic } = useMidiInput({

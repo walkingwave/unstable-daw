@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test:timeline": "node src/timelineOps.test.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test test/*.test.mjs",

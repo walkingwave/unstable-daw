@@ -1,118 +1,144 @@
-# Backing Track Generator
+# Unstable DAW
 
-Project Track: Stable Audio
+Hum a tune into your laptop, get it back as notes you can edit, then ask for a
+band to play along with it. Unstable DAW is a small music workstation that runs
+in the browser and uses Stable Audio 3 to fill in the parts you can't play
+yourself.
 
-Record or upload a **monophonic hum**, turn it into a clear, editable melody or
-bassline MIDI clip, then render that exact musical guide as usable audio for Stable
-Audio 3. Export the original hum, transformed MIDI, guide WAV, and final audio to a
-DAW.
+![The Studio view, with a hummed melody turned into a MIDI clip](docs/screenshots/studio.png)
 
-See [PLAN.md](PLAN.md) for the full design and rationale.
+We built it in a weekend at the **Music Tech Hackathon Montreal** (August 22-23,
+2026) for the Stability AI track. The brief was to make something for musicians
+using Stable Audio 3. We kept coming back to the same moment: you have a melody
+stuck in your head, you're not near an instrument, and by the time you've found
+one or opened a real DAW the idea has gone. So the app starts there. You hum,
+and everything else gets built around what you hummed.
+
+## What you can do with it
+
+**Turn a hum into MIDI.** Record straight from the mic or upload a file on the
+Generate tab. One line only: a hum, a whistle, a sung phrase. The app works out
+the tempo and key and turns the pitch into notes. You pick whether it becomes a
+melody or a bassline. If it gets the tempo or key wrong you can fix it before
+anything is written.
+
+**Edit it like a normal DAW.** The Studio has a timeline with multiple tracks,
+a piano roll for MIDI clips, snap to grid, split, duplicate, undo/redo, and
+mute/solo. You can also record or import audio onto a track.
+
+**Ask for the rest of the band.** The bar at the bottom of the Studio takes plain
+English, like *"bass, drums and piano, bossa nova"* or *"something slow and sad
+for a rainy night"*. A language model reads the request and turns it into a
+list of concrete edits: which tracks to add, at what tempo and key, in what
+style. The app then carries those out with the same functions the buttons use.
+When you ask for several parts at once, Stable Audio renders them as one
+performance and we split that recording into stems, so the drums and bass
+actually sound like they were in the same room.
+
+**Make your own instruments.** Any MIDI track can load any instrument, and
+swapping it never touches the notes.
+
+![The Instruments tab](docs/screenshots/instruments.png)
+
+If you type the name of a real instrument (cello, nylon guitar, vibraphone) it
+plays through a sampled recording of that instrument. If you describe something
+that doesn't exist, like *"glass bells underwater"*, Stable Audio generates a few
+one-shot samples and the app pitches them across the keyboard. In both cases
+your notes play back exactly as you wrote them.
+
+**Take it with you.** Export gives you a zip with every stem as a WAV, the MIDI,
+your original recording, and a manifest of the prompt, seed and settings behind
+each part, so you can drag it all into Ableton or Logic and keep going.
 
 ## How it works
 
-Stable Audio 3 has no melody or chord conditioning and no stem output, so we cannot
-just hand it the vocal and ask for a bassline. Instead we build a **guide track**:
+Stable Audio 3 is a text-to-audio model. It has no way to accept a melody or a
+chord progression, and it doesn't output separate instruments. If you give it
+your hum as the starting audio, one of two things happens. Keep the noise low
+and your voice is still audible in the result. Push it higher and the timing
+falls apart.
+
+What we do instead is give it a **guide track**. We analyze the hum, write the
+part we want as MIDI, render that MIDI with a deliberately plain synth, and hand
+that to Stable Audio as the starting audio. The rhythm and pitches are already
+baked into what the model starts from, so it keeps the skeleton and replaces the
+sound. The result comes out in time, in key, and mostly just the instrument we
+asked for.
 
 ```
 hum.wav
-  1. ANALYZE       voiced note events, BPM, key, and beat/bar grid
-  2. TRANSFORM     hum contour -> melody MIDI or bassline MIDI
-  3. REVIEW        user may correct tempo/key and edit the MIDI notes
-  4. RENDER GUIDE  transformed MIDI -> clear synthetic guide WAV
-  5. GENERATE      Stable Audio 3 audio-to-audio, init_audio = guide
-  6. ALIGN         time-stretch and phase-lock output to the guide/grid
+  1. ANALYZE       notes, tempo, key, bar grid
+  2. TRANSFORM     hum -> melody or bassline MIDI
+  3. REVIEW        you fix tempo/key and edit notes
+  4. RENDER GUIDE  MIDI -> plain synth WAV
+  5. GENERATE      Stable Audio 3, audio-to-audio from the guide
+  6. ALIGN         stretch and nudge the result back onto the grid
 ```
 
-The transformed MIDI is the primary deliverable: it must be musically legible and
-usable without generation. The guide WAV renders those same notes, so Stable Audio
-receives explicit pitch and rhythm rather than raw vocal audio. For a **melody**
-request, the system preserves the hummed contour, phrase timing, and rests. For a
-**bassline** request, it moves that contour into a playable bass register and
-simplifies it onto the detected/edited harmonic grid. The existing backing-stem
-flow remains available while this becomes the default input experience.
+For full-band requests there's an extra step: generate the whole arrangement as
+one master, then separate it into stems with Demucs, using the MIDI we wrote to
+decide what belongs where.
 
-## Setup
+[PLAN.md](PLAN.md) has the original design and the reasoning behind it, and the
+`docs/` folder has notes on the individual pieces.
 
-**macOS / Linux:**
+## Running it
+
+You'll need Python 3.11+, Node.js, and [uv](https://docs.astral.sh/uv/). The setup
+scripts install uv if it's missing, grab `rubberband` for time-stretching, install
+the Python packages and build the frontend.
+
+macOS / Linux:
 
 ```bash
 ./scripts/setup.sh
 ```
 
-**Windows (PowerShell):**
+Windows (PowerShell):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 ```
 
-Either installs `uv`, the `rubberband` binary, and the Python dependencies. On
-Windows `rubberband` is optional — without it the pipeline falls back to
-librosa's phase vocoder, so stem generation still works out of the box. Then:
+On Windows `rubberband` is optional. Without it the app falls back to librosa's
+time-stretching.
+
+Then copy the example environment file and start the server:
 
 ```bash
-cp .env.example .env      # optional, for the API backend  (Windows: copy .env.example .env)
+cp .env.example .env        # Windows: copy .env.example .env
 uv run uvicorn backend.api:app --reload
 ```
 
-Open http://127.0.0.1:8000
+Open http://127.0.0.1:8000.
 
-Works immediately on the **mock** backend — no model weights, no API key, no network.
-Use it to build and test everything except the audio quality itself.
+That's enough to click around. With no keys set, pick the **Mock** model in the
+header: it returns noisy versions of the guide instantly, so you can try the whole
+flow offline without spending anything.
 
-### DeepSeek chat agent
+### API keys
 
-The Studio ask bar calls `/api/interpret`, which uses DeepSeek when
-`DEEPSEEK_API_KEY` is set and falls back to the offline rules parser when it is
-not. DeepSeek only returns a structured generation plan; the app still executes
-the existing `/api/generate` pipeline and SA3 calls itself.
+Both go in `.env`. Restart the server after changing it.
 
-1. Create a DeepSeek account and API key from the DeepSeek platform.
-2. Add the key to `.env`:
+| Key | What it unlocks |
+|---|---|
+| `STABILITY_API_KEY` | Stable Audio 3 Large through the Stability API. Best quality. Get a key at [platform.stability.ai](https://platform.stability.ai/account/keys). |
+| `DEEPSEEK_API_KEY` | The plain-English bar in the Studio. Without it, a simple keyword parser handles requests like "bass and drums, funk" but won't follow anything more subtle. |
 
-```bash
-DEEPSEEK_API_KEY=your_key_here
-BTG_AGENT_PROVIDER=deepseek
-BTG_AGENT_MODEL=deepseek-v4-flash
-```
+### Choosing a model
 
-Restart the backend after editing `.env`.
+The model dropdown in the header lists what your machine can actually use.
+Anything unavailable is greyed out. If a generation fails partway through, the
+server retries on a backend that works and tells you which one ran.
 
-## Backends
-
-Pick one in the UI header, per generation. Availability is detected live, so a
-backend you cannot use is shown disabled rather than failing on click. If a
-generation fails mid-flight, the server falls back to a working backend and reports
-which one actually ran.
-
-| Backend | Setup | Notes |
+| Model | Setup | Notes |
 |---|---|---|
-| `mock` | none | Returns the guide with noise. For UI work and offline demos. Runs anywhere. |
-| `local` | `uv sync --extra local` + HF access | `small-music` 0.6B. Free, offline. Runs on any OS — see runtimes below. |
-| `api` | `STABILITY_API_KEY` in `.env` | `large` 2.7B. Best quality, uses credits, needs network. Runs anywhere. |
+| Mock | none | Instant and offline. For trying the UI. |
+| Stability API | `STABILITY_API_KEY` | Stable Audio 3 Large. Uses credits and needs a connection. |
+| Local | `uv sync --extra local` plus Hugging Face access to the weights | Free and offline, but slower. Runs `small-music` on CPU anywhere; `medium` needs an NVIDIA GPU. |
 
-The `local` backend has two runtimes and picks whichever is installed:
-
-- **PyTorch** (`uv sync --extra local`) — Windows, Linux, macOS. `small-music`
-  runs on **CPU** (works with no GPU, and on AMD, where PyTorch has no CUDA
-  path); `medium` needs an NVIDIA GPU with CUDA + Flash Attention 2. CPU
-  generation is slow but real. Set the DiT with `BTG_TORCH_DIT`.
-- **MLX** — Apple Silicon only, faster there. Preferred automatically on a Mac.
-
-On any machine without a local runtime installed, `local` shows disabled in the
-selector. Use `mock` for offline work and `api` for best quality.
-
-### Local backend: Stable Audio 3 MLX
-
-The local backend shells out to Stability AI's optimized MLX implementation. It
-is Apple-Silicon-native and stores its own virtualenv and weights outside this
-repo. By default this app looks for it at:
-
-```text
-../sa3-mlx-src/optimized/mlx
-```
-
-Install it with:
+On Apple Silicon there's also a faster MLX runtime for local generation. Clone
+Stability's repo next to this one and install it:
 
 ```bash
 cd ..
@@ -121,190 +147,129 @@ cd sa3-mlx-src/optimized/mlx
 ./install.sh -y
 ```
 
-If you install it somewhere else, set:
+The app looks for it at `../sa3-mlx-src/optimized/mlx`. If you put it somewhere
+else, set `BTG_MLX_ROOT`. Set `BTG_MLX_DIT=sm-music` to force the smaller, faster
+model.
+
+### Working on the frontend
+
+For hot reload, keep the Python server running and start Vite alongside it. It
+proxies `/api` to port 8000.
 
 ```bash
-BTG_MLX_ROOT=/absolute/path/to/stable-audio-3/optimized/mlx
+npm --prefix web run dev
 ```
 
-The app auto-detects whichever MLX weights are present and prefers `medium`
-when available, then `sm-music`. To force the faster model:
+## Studio shortcuts
+
+| Key | Action |
+|---|---|
+| Space | Play / pause |
+| S | Split the selected clip at the playhead |
+| D | Duplicate the selected clip or region |
+| Delete / Backspace | Delete the selected clip or region |
+| Ctrl/Cmd + Z | Undo (add Shift to redo) |
+| + / - | Zoom in / out |
+| Esc | Clear the selected region |
+
+## Command line
+
+The CLI is quicker than the UI when you're tuning prompts or noise levels.
 
 ```bash
-BTG_MLX_DIT=sm-music
-```
-
-Verify through this app's local backend:
-
-```bash
-uv run btg --input samples/fixtures/amin_100.wav --part bass --backend local
-```
-
-Then start this app and select the `local` backend.
-
-## CLI
-
-Faster than the UI when tuning prompts and noise values.
-
-```bash
-uv run python scripts/make_test_vocals.py           # 18 fixtures with known BPM/key
+uv run python scripts/make_test_vocals.py      # generate test hums with known tempo/key
 
 uv run btg --input samples/fixtures/amin_100.wav --hum-target melody
-uv run btg --input samples/fixtures/amin_100.wav --hum-target bass --style "warm fingered electric bass"
-uv run btg --input samples/fixtures/amin_100.wav --part bass
-uv run btg --input samples/fixtures/amin_100.wav --all --backend local
 uv run btg --input samples/fixtures/amin_100.wav --part bass --style "bossa nova"
 uv run btg --input samples/fixtures/amin_100.wav --part bass --sweep 0.5,0.65,0.8,0.9
 ```
 
-`--sweep` is the important one: `noise` (the model's divergence from the guide) is
-the single most important knob, and the right value has to be found by ear.
-Output lands in `sessions/<id>/`.
+`--sweep` renders the same part at several noise levels. Noise controls how far
+the model is allowed to wander from the guide, and it matters more than any other
+setting. There's no right value on paper, you have to listen. Output goes to
+`sessions/<id>/`.
 
-### Validate input analysis
-
-Use the analysis-only command to inspect the signal before guide generation or
-Stable Audio 3. It writes a cleaned 44.1 kHz mono WAV and metadata containing
-BPM, key, downbeat, chords, melody notes, and MIDI pitches:
+To check what the analysis hears before anything gets generated:
 
 ```bash
 uv run analysis-test --input samples/fixtures/amin_100.wav
-uv run analysis-test --input samples/fixtures/amin_100.wav --output backend/test/test_run/amin-check
-uv run analysis-test --input samples/beatbox.wav --mode beatbox
-uv run analysis-test --clean  # remove prior generated test runs
 ```
 
-The default output directory is a sortable timestamp such as
-`backend/test/test_run/analysis_test_2026-08-22_16-43-09/`. The preprocessing is deliberately
-conservative: it removes DC, trims only outer silence, applies
-a content-aware high-pass filter, and normalizes with headroom. Use
-`--no-trim` or `--no-high-pass` when comparing their effect on analysis.
-
-## Layout
+## Project layout
 
 ```
 backend/
-  config.py        paths and tunable defaults — start here
-  models.py        Analysis, Bar, StemResult. The contract between stages.
-  theory.py        note names, triads, scales, diatonic transposition
-  analysis.py      stage 1
-  arrange.py       stage 2 — one function per part
-  render_guide.py  stage 3
-  sa3_backend.py   stage 4 — mock | local | api, behind one interface
-  align.py         stage 5
-  pipeline.py      the only module that knows the stage order
-  api.py           HTTP routes. Thin — musical logic lives in the stages.
-  cli.py           headless runner
-  test/             developer validation CLIs and ignored test-run artifacts
-web/               React/Vite frontend and Node test suite
-scripts/           setup and test-fixture generation
-sessions/<id>/     vocal, guides, stems, MIDI, and a meta.json provenance record
+  api.py             HTTP routes (FastAPI). Kept thin.
+  pipeline.py        runs the stages in order; the only file that knows the order
+  analysis.py        tempo, key, bar grid
+  pitch_tracking.py  hum -> note events
+  hum_transform.py   note events -> melody or bassline MIDI
+  arrange.py         writes the MIDI for each backing part
+  grooves.py         rhythm patterns per genre
+  render_guide.py    MIDI -> guide WAV
+  prompts.py         prompt text per part
+  sa3_backend.py     mock / local / api behind one interface
+  align.py           snaps generated audio back to the grid
+  separate.py        splits a full-band master into stems (Demucs)
+  mix.py             EQ and levels so separately made stems sit together
+  agent.py           plain-English request -> list of Studio actions
+  interpret.py       plain-English request -> generation plan
+  compose.py         plain-English description -> MIDI phrase
+  instruments.py     one-shot samples for generated instruments
+  session.py         on-disk projects and their provenance record
+  cli.py             command-line runner
+web/src/
+  App.jsx            app state, tabs, project open/save/export
+  components/        Studio, piano roll, recorder, instruments
+  useTimeline.js     playback engine and track/clip state
+  useSampler.js      plays MIDI through soundfonts or generated samples
+scripts/             setup and test fixture generation
+sessions/<id>/       each project's audio, MIDI and meta.json
 ```
 
-### DeepSeek validation
-
-Validate the complete analysis-to-DeepSeek planning path with an API key in `.env`:
+## Tests
 
 ```bash
-uv run deepseek-test --input samples/fixtures/amin_100.wav \
-  --prompt "add upright bass, Rhodes, and soft bossa nova drums" \
-  --require-deepseek --expect-tracks
+uv run --with pytest python -m pytest backend/test   # backend
+npm --prefix web test                                # frontend
+npm --prefix web run test:timeline                   # timeline edit operations
 ```
 
-This writes a cleaned WAV, analysis metadata, redacted request/response plans, and
-`validation.json` under `backend/test/test_run/deepseek_test_<timestamp>/`. It sends
-only derived musical metadata and the request text to DeepSeek—never audio bytes,
-local paths, or credentials. Omit `--require-deepseek` to permit the offline rules
-fallback for a no-network smoke test.
+One of the backend tests reads the synthetic fixtures, so run
+`uv run python scripts/make_test_vocals.py` first.
 
-### Frontend interpretation-to-generation integration test
-
-With the backend running, exercise the same HTTP flow used by the Studio ask
-bar. The default `mock` backend reaches the generation adapter without loading
-SA3; use `--backend local` only for an intentional MLX SA3 smoke test.
+Tempo and key detection have their own accuracy suite with 18 fixtures of known
+tempo and key. The hard half adds rubato, room noise, detuning and melodies that
+avoid the tonic. Run it after touching `analysis.py` or `melody.py`, since a
+single test file can't tell a real improvement from a lucky one.
 
 ```bash
-uv run uvicorn backend.api:app --reload
-npm --prefix web run test:integration -- --backend mock
-npm --prefix web run test:integration -- --backend local --require-deepseek
+uv run python scripts/eval_analysis.py
 ```
 
-Each invocation stores redacted request/response JSON and two validation
-results under `web/test/test_run/frontend_interpret_generate_test_<timestamp>/`.
-Run the dependency-free runner tests with `npm --prefix web test`.
+Currently 18/18 on tempo and 18/18 on key.
 
-### Sessions
+### Why key detection looks at phrase endings
 
-Projects persist under `sessions/`. Use the Studio header **Open** button to
-load a saved project, **Close** to clear it from this browser while retaining
-server files, and **Delete** to permanently remove it after confirmation.
-Deletion is rejected while that session is generating. Session list responses
-contain summaries only; audio remains available through the existing session
-audio routes.
-
-### Adding a backing part
-
-1. Add the name to `PARTS` in `models.py`
-2. Write `_arrange_<name>` in `arrange.py` and register it in `ARRANGERS`
-3. Add an instrument phrase and an isolation clause in `prompts.py`
-4. Add the corresponding UI support under `web/src/` if needed
-
-## Measuring detection accuracy
-
-Tempo and key detection have a fixture suite with ground truth. **Run this after
-any change to `analysis.py` or `melody.py`** — it is the only way to tell a real
-improvement from a lucky guess on one file.
-
-```bash
-uv run python scripts/make_test_vocals.py   # 18 synthetic vocals, known BPM/key
-uv run python scripts/eval_analysis.py      # score against ground truth
-```
-
-Two tiers. The **easy** tier is clean: steady tempo, melodies that resolve to the
-tonic. The **hard** tier adds what real recordings have — ±3% rubato, room noise,
-detuning, an offset start, and melodies that dwell on the mediant and only touch
-the tonic at phrase endings.
-
-Current: **18/18 tempo, 18/18 key.**
-
-Key detection scores two ways. *Exact* means tonic and mode both right. *Note-set*
-means the right pitches but possibly the wrong tonic — that is the relative-key
-failure (C major for A minor), and it is the one worth watching, because pitch
-histograms alone cannot fix it.
-
-### How key detection works, and why
-
-A key and its relative contain **exactly the same pitches**, so any method that
-scores a pitch histogram is guessing between them. What separates them is where
-the melody *lands*: phrases resolve to the tonic. So `analysis.py` scores each of
-the 24 candidate keys by profile correlation **plus** bonuses for the tonic
-appearing at phrase endings, at the final note, and at the first note.
-
-Ablation on the hard tier:
-
-| Method | hard tier |
-|---|---|
-| Temperley profile + melodic cues (current) | 8/8 |
-| Temperley profile alone | 4/8 |
-| Krumhansl profile alone | 0/8 |
+A minor key and its relative major use exactly the same notes, so counting which
+pitches show up can't tell A minor from C major. What gives it away is where the
+melody comes to rest. `analysis.py` scores all 24 keys against a pitch profile and
+then adds weight for the tonic showing up at the ends of phrases and on the first
+and last notes. On the hard fixtures that took us from 4/8 to 8/8.
 
 ## Known limitations
 
-- **Chord detection on a solo vocal is weak.** One melody genuinely fits many
-  progressions. The UI exposes an editable chord grid for exactly this reason —
-  treat the detected chords as a first guess.
-- **4/4 is assumed** throughout.
-- **Harmony depends on clean monophonic pitch tracking.** Noisy or breathy input
-  degrades it.
-- Everything above is measured on *synthetic* fixtures. Real voices have more
-  vibrato, breath and consonant noise. Re-check against real recordings.
+- Chords guessed from a single sung line are shaky. One melody fits plenty of
+  progressions, so treat them as a starting point.
+- Everything assumes 4/4.
+- Breathy or noisy recordings give worse notes. Hum close to the mic, one note at
+  a time.
+- Our accuracy numbers come from synthetic test hums. Real voices have more
+  vibrato and breath, so expect it to miss more often.
+- Generated instruments are pitch-shifted one-shots. They sound fine for short
+  notes but they're not a replacement for a real sampled instrument.
 
-### Two library traps worth knowing
+## Team
 
-- `librosa.beat.beat_track` must be given an onset envelope explicitly. Letting it
-  derive one from `y` uses median aggregation, which goes flat on sustained
-  material and reports **0 BPM**. Both `analysis.py` and `align.py` work around it.
-- Pitch contours must be **median-filtered before rounding to semitones**.
-  Vibrato that crosses a semitone boundary otherwise chops one held note into a
-  stutter of fragments, destroying the note-duration evidence key detection
-  depends on. See `SMOOTHING_FRAMES` in `melody.py`.
+Made at Music Tech Hackathon Montreal 2026 by Dylan H, Le-Tao Li and Gilberto
+Tumangday.

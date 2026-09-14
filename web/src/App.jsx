@@ -17,7 +17,7 @@ export default function App() {
   const [backends, setBackends] = useState([]);
   const [backend, setBackend] = useState(() => {
     const stored = localStorage.getItem('backend');
-    return stored && stored !== 'mock' ? stored : 'local';
+    return stored || 'api';
   });
   const [sessionId, setSessionId] = useState(null);
   // Mirror of sessionId that async flows can trust. State reads inside a
@@ -238,8 +238,31 @@ export default function App() {
       .then((list) => {
         setBackends(list);
         setBackend((current) => {
+          if (current === 'local') {
+            const api = list.find((b) => b.id === 'api' && b.available);
+            if (api) {
+              localStorage.setItem('backend', api.id);
+              return api.id;
+            }
+            const mock = list.find((b) => b.id === 'mock' && b.available);
+            if (mock) {
+              localStorage.setItem('backend', mock.id);
+              return mock.id;
+            }
+          }
           if (list.some((b) => b.id === current && b.available)) return current;
+          const api = list.find((b) => b.id === 'api' && b.available);
+          if (api) {
+            localStorage.setItem('backend', api.id);
+            return api.id;
+          }
+          const mock = list.find((b) => b.id === 'mock' && b.available);
+          if (mock) {
+            localStorage.setItem('backend', mock.id);
+            return mock.id;
+          }
           const usable = list.find((b) => b.available);
+          if (usable) localStorage.setItem('backend', usable.id);
           return usable ? usable.id : current;
         });
       })
@@ -398,6 +421,15 @@ export default function App() {
     },
     [backend, ensureSession, warnOnFallback],
   );
+
+  const uploadTimelineAudio = useCallback(
+    async (blob, name = 'clip') => {
+      const id = sessionId || (await ensureSession());
+      return apiClient.uploadSessionAudio(id, blob, name);
+    },
+    [sessionId, ensureSession],
+  );
+
   const ensureVocalTrack = useCallback(async () => {
     if (vocalAddedRef.current || !vocalWavRef.current) return;
     const buffer = await engine.context().decodeAudioData(await vocalWavRef.current.arrayBuffer());
@@ -661,6 +693,7 @@ export default function App() {
           instruments={library.instruments}
           sampler={sampler}
           backend={backend}
+          onUploadAudio={uploadTimelineAudio}
         />
       )}
 

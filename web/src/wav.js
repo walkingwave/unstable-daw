@@ -15,8 +15,12 @@ export async function blobToWav(blob) {
 export function audioBufferToWav(buffer, offsetSec = 0, durationSec = null) {
   if (offsetSec === 0 && durationSec == null) return encodeWav(buffer);
   const sr = buffer.sampleRate;
-  const startFrame = Math.floor(offsetSec * sr);
-  const frames = durationSec == null ? buffer.length - startFrame : Math.floor(durationSec * sr);
+  const startFrame = Math.max(0, Math.min(buffer.length, Math.floor((offsetSec || 0) * sr)));
+  const requestedFrames = durationSec == null
+    ? buffer.length - startFrame
+    : Math.floor(Math.max(0, durationSec || 0) * sr);
+  const frames = Math.max(0, Math.min(requestedFrames, buffer.length - startFrame));
+  if (frames <= 0) throw new Error('Selected audio region is empty');
   const region = new AudioBuffer({
     numberOfChannels: buffer.numberOfChannels,
     length: frames,

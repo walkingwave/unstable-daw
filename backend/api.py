@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import logging
 import threading
+import uuid
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import soundfile as sf
 import pretty_midi
 
-from . import compose, config, hum_transform, instruments, interpret, pipeline, sa3_backend
+from . import agent, compose, config, hum_transform, instruments, interpret, pipeline, sa3_backend
 from .analysis import rebuild_bar_grid
 from .models import PARTS
 from .session import Session
@@ -405,6 +406,36 @@ def interpret_request(request: InterpretRequest) -> dict:
     return {**plan.model_dump(), "interpreter": source}
 
 
+class AgentPlanRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+    studio_context: dict = {}
+
+
+@app.post("/api/agent/plan")
+def agent_plan(request: AgentPlanRequest) -> dict:
+    """Turn a Studio chat message into executable UI/backend actions."""
+    raw = request.studio_context or {}
+    context = agent.AgentRequestContext(
+        original_request=request.message,
+        session_id=request.session_id,
+        bpm=raw.get("bpm"),
+        key=raw.get("key"),
+        mode=raw.get("mode"),
+        backend=raw.get("backend"),
+        seconds_per_bar=raw.get("seconds_per_bar"),
+        playhead=raw.get("playhead"),
+        duration=raw.get("duration"),
+        selected_track_id=raw.get("selected_track_id"),
+        selected_clip_id=raw.get("selected_clip_id"),
+        selected_region=raw.get("selected_region"),
+        tracks=raw.get("tracks") or [],
+        recent_actions=raw.get("recent_actions") or [],
+    )
+    plan, source = agent.plan_actions(request.message, context)
+    return {**plan.model_dump(), "interpreter": source}
+
+
 class ComposeMidiRequest(BaseModel):
     text: str
     session_id: str | None = None
@@ -606,6 +637,67 @@ def create_blank_session(request: BlankSessionRequest) -> dict:
     return {"session_id": session.id, "analysis": analysis.to_dict()}
 
 
+class TimelineRequest(BaseModel):
+    version: int = 1
+    bpm: float | None = None
+    key: str | None = None
+    mode: str | None = None
+    tracks: list[dict] = []
+
+
+@app.get("/api/session/{session_id}/timeline")
+def get_timeline(session_id: str) -> dict:
+    """Current editable Studio timeline for this session."""
+    return _load(session_id).timeline or {"version": 1, "tracks": []}
+
+
+@app.put("/api/session/{session_id}/timeline")
+def save_timeline(session_id: str, request: TimelineRequest) -> dict:
+    """Persist the browser Studio timeline as serializable metadata."""
+    timeline = request.model_dump()
+    return _load(session_id).save_timeline(timeline)
+
+
+class OperationRequest(BaseModel):
+    source: str = "manual"
+    type: str
+    message: str = ""
+    actions: list[dict] = []
+    result: dict = {}
+
+
+@app.get("/api/session/{session_id}/operations")
+def get_operations(session_id: str, limit: int = 100) -> list[dict]:
+    return _load(session_id).operations(limit=max(1, min(200, limit)))
+
+
+@app.post("/api/session/{session_id}/operations")
+def record_operation(session_id: str, request: OperationRequest) -> dict:
+    return _load(session_id).record_operation(request.model_dump())
+
+
+@app.post("/api/session/{session_id}/uploads/audio")
+async def upload_audio(session_id: str, audio: UploadFile = File(...), name: str = Form("clip")) -> dict:
+    """Persist imported/recorded browser audio so timeline restore can fetch it."""
+    session = _load(session_id)
+    filename = f"{_safe_name(Path(name or audio.filename or 'clip').stem)}-{uuid.uuid4().hex[:8]}.wav"
+
+    source, sr = sf.read(io.BytesIO(await audio.read()), dtype="float32")
+    if source.ndim > 1:
+        source = source.mean(axis=1)
+    if sr != config.SAMPLE_RATE:
+        import librosa
+
+        source = librosa.resample(source, orig_sr=sr, target_sr=config.SAMPLE_RATE)
+
+    path = session.upload_path(filename)
+    session.write_audio(path, source)
+    return {
+        "audio_url": f"/api/session/{session.id}/audio/uploads/{filename}",
+        "duration": len(source) / config.SAMPLE_RATE,
+    }
+
+
 @app.post("/api/generate-from-reference")
 async def generate_from_reference(
     session_id: str = Form(...),
@@ -706,8 +798,10 @@ def delete_session(session_id: str) -> dict:
 
 @app.get("/api/session/{session_id}/audio/{kind}/{filename}")
 def get_audio(session_id: str, kind: str, filename: str) -> FileResponse:
-    """Serve a wav from a session. `kind` is guides or stems."""
-    if kind not in ("guides", "stems"):
+    """Serve a wav from a session. `kind` is guides, stems, or uploads."""
+    if kind not in ("guides", "stems", "uploads"):
+        raise HTTPException(404, "not found")
+    if Path(filename).name != filename or not filename.endswith(".wav"):
         raise HTTPException(404, "not found")
 
     session = _load(session_id)

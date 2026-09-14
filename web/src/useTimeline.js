@@ -1,4 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  clampMoveStart,
+  duplicateClipPiece,
+  duplicateRegionPiece,
+  deleteRegionPieces,
+  extractRegionPieces,
+  replacementPieces,
+  splitClipPieces,
+} from './timelineOps.js';
 
 // A clip-based multitrack timeline. Tracks hold clips; each clip is a decoded
 // AudioBuffer placed at an arbitrary start time, so a backing stem can be
@@ -12,7 +21,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 // Clip:   { id, start, duration, offset, part, prompt, seed, backendUsed }
 //   start    seconds on the timeline where the clip begins
 //   offset   seconds into the buffer where playback starts (for split clips)
-//   duration seconds of the buffer to play from offset
+//   duration seconds occupied on the timeline; any overhang past the buffer
+//            plays as silence.
 
 let counter = 0;
 const uid = (p) => `${p}-${++counter}`;
@@ -28,7 +38,15 @@ export function useTimeline(sampler) {
   const offsetRef = useRef(0);
   const rafRef = useRef(null);
 
-  const [tracks, setTracks] = useState([]);
+  const [tracks, setTracksState] = useState([]);
+  const tracksRef = useRef([]);
+  const setTracks = useCallback((updater) => {
+    setTracksState((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      tracksRef.current = next;
+      return next;
+    });
+  }, []);
   // Tempo, so MIDI clips can turn their beat-based notes into seconds.
   const bpmRef = useRef(100);
   const setBpm = useCallback((value) => {
@@ -44,39 +62,64 @@ export function useTimeline(sampler) {
   const futureRef = useRef([]);
   const [historyTick, setHistoryTick] = useState(0);
   const bumpHistory = () => setHistoryTick((v) => v + 1);
+  const stopActiveAudio = () => {
+    nodesRef.current.forEach((n) => {
+      try {
+        n.stop();
+      } catch {
+        /* already stopped */
+      }
+    });
+    nodesRef.current = [];
+    gainsRef.current = {};
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    setPlaying(false);
+  };
 
   // Snapshot the current state as one undo step. Discrete edits call this
   // themselves; continuous gestures (dragging a clip, trimming an edge)
   // call it once on pointer-down so a whole drag collapses into one undo
   // instead of one per mouse-move.
   const beginGesture = useCallback(() => {
-    setTracks((prev) => {
-      pastRef.current = [...pastRef.current, prev].slice(-HISTORY_LIMIT);
-      futureRef.current = [];
-      return prev;
-    });
+    pastRef.current = [...pastRef.current, tracksRef.current].slice(-HISTORY_LIMIT);
+    futureRef.current = [];
     bumpHistory();
   }, []);
 
+  const commitTracks = useCallback((mutate) => {
+    const prev = tracksRef.current;
+    const next = mutate(prev);
+    if (next === prev) return false;
+    pastRef.current = [...pastRef.current, prev].slice(-HISTORY_LIMIT);
+    futureRef.current = [];
+    tracksRef.current = next;
+    setTracksState(next);
+    bumpHistory();
+    return true;
+  }, []);
+
   const undo = useCallback(() => {
-    setTracks((prev) => {
-      if (!pastRef.current.length) return prev;
-      const restored = pastRef.current[pastRef.current.length - 1];
-      pastRef.current = pastRef.current.slice(0, -1);
-      futureRef.current = [...futureRef.current, prev];
-      return restored;
-    });
+    stopActiveAudio();
+    if (!pastRef.current.length) return;
+    const prev = tracksRef.current;
+    const restored = pastRef.current[pastRef.current.length - 1];
+    pastRef.current = pastRef.current.slice(0, -1);
+    futureRef.current = [...futureRef.current, prev];
+    tracksRef.current = restored;
+    setTracksState(restored);
     bumpHistory();
   }, []);
 
   const redo = useCallback(() => {
-    setTracks((prev) => {
-      if (!futureRef.current.length) return prev;
-      const restored = futureRef.current[futureRef.current.length - 1];
-      futureRef.current = futureRef.current.slice(0, -1);
-      pastRef.current = [...pastRef.current, prev].slice(-HISTORY_LIMIT);
-      return restored;
-    });
+    stopActiveAudio();
+    if (!futureRef.current.length) return;
+    const prev = tracksRef.current;
+    const restored = futureRef.current[futureRef.current.length - 1];
+    futureRef.current = futureRef.current.slice(0, -1);
+    pastRef.current = [...pastRef.current, prev].slice(-HISTORY_LIMIT);
+    tracksRef.current = restored;
+    setTracksState(restored);
     bumpHistory();
   }, []);
 
@@ -113,19 +156,26 @@ export function useTimeline(sampler) {
 
   // --- structure ---------------------------------------------------------
 
-  const addTrack = useCallback((name, kind) => {
+  const addTrack = useCallback((name, kind, meta = {}) => {
     const id = uid('trk');
-    beginGesture();
-    setTracks((prev) => [
+    commitTracks((prev) => [
       ...prev,
-      { id, name, kind: kind || 'audio', muted: false, soloed: false, volume: 1, clips: [] },
+      {
+        id,
+        name,
+        kind: kind || 'audio',
+        instrument: meta.instrument ?? null,
+        muted: meta.muted ?? false,
+        soloed: meta.soloed ?? false,
+        volume: meta.volume ?? 1,
+        clips: [],
+      },
     ]);
     return id;
-  }, [beginGesture]);
+  }, [commitTracks]);
 
   const addClip = useCallback((trackId, buffer, meta = {}) => {
     const id = uid('clip');
-    beginGesture();
     buffersRef.current[id] = buffer;
     const clip = {
       id,
@@ -137,12 +187,19 @@ export function useTimeline(sampler) {
       seed: meta.seed ?? null,
       backendUsed: meta.backendUsed ?? null,
       startBar: meta.startBar ?? 0,
+      audioUrl: meta.audioUrl ?? null,
     };
-    setTracks((prev) =>
-      prev.map((t) => (t.id === trackId ? { ...t, clips: [...t.clips, clip] } : t)),
-    );
+    commitTracks((prev) => {
+      let changed = false;
+      const next = prev.map((t) => {
+        if (t.id !== trackId) return t;
+        changed = true;
+        return { ...t, clips: [...t.clips, clip] };
+      });
+      return changed ? next : prev;
+    });
     return id;
-  }, [beginGesture]);
+  }, [commitTracks]);
 
   // A MIDI track: its clip carries notes rather than audio, and stays
   // silent until rendered. The instrument prompt lives on the track, so
@@ -151,7 +208,6 @@ export function useTimeline(sampler) {
     (name, instrument, meta = {}) => {
       const trackId = uid('trk');
       const clipId = uid('clip');
-      beginGesture();
       const clip = {
         id: clipId,
         start: meta.start ?? 0,
@@ -168,22 +224,22 @@ export function useTimeline(sampler) {
         startBar: 0,
         midiUrl: meta.midiUrl ?? null,
       };
-      setTracks((prev) => [
+      commitTracks((prev) => [
         ...prev,
         {
           id: trackId,
           name,
           kind: 'midi',
           instrument,
-          muted: false,
-          soloed: false,
-          volume: 1,
+          muted: meta.muted ?? false,
+          soloed: meta.soloed ?? false,
+          volume: meta.volume ?? 1,
           clips: [clip],
         },
       ]);
       return { trackId, clipId };
     },
-    [beginGesture],
+    [commitTracks],
   );
 
   // Replace a MIDI clip's notes. Not a history step per edit — the piano
@@ -203,28 +259,28 @@ export function useTimeline(sampler) {
   // audible without losing the notes that produced it.
   const attachBuffer = useCallback((trackId, clipId, buffer, meta = {}) => {
     buffersRef.current[clipId] = buffer;
-    setTracks((prev) =>
-      prev.map((t) =>
-        t.id === trackId
-          ? {
-              ...t,
-              clips: t.clips.map((c) =>
-                c.id === clipId
-                  ? { ...c, duration: meta.duration ?? buffer.duration, ...meta }
-                  : c,
-              ),
-            }
-          : t,
-      ),
-    );
-  }, []);
+    commitTracks((prev) => {
+      let changed = false;
+      const next = prev.map((t) => {
+        if (t.id !== trackId) return t;
+        return {
+          ...t,
+          clips: t.clips.map((c) => {
+            if (c.id !== clipId) return c;
+            changed = true;
+            return { ...c, duration: meta.duration ?? buffer.duration, ...meta };
+          }),
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, [commitTracks]);
 
   // Convenience: create a track for a part and drop one clip on it.
   const addTrackWithClip = useCallback(
     (name, kind, buffer, meta = {}) => {
       const trackId = uid('trk');
       const clipId = uid('clip');
-      beginGesture();
       buffersRef.current[clipId] = buffer;
       const clip = {
         id: clipId,
@@ -240,13 +296,22 @@ export function useTimeline(sampler) {
         // reload; AudioBuffers themselves cannot be persisted.
         audioUrl: meta.audioUrl ?? null,
       };
-      setTracks((prev) => [
+      commitTracks((prev) => [
         ...prev,
-        { id: trackId, name, kind: kind || 'audio', muted: false, soloed: false, volume: 1, clips: [clip] },
+        {
+          id: trackId,
+          name,
+          kind: kind || 'audio',
+          instrument: meta.instrument ?? null,
+          muted: meta.muted ?? false,
+          soloed: meta.soloed ?? false,
+          volume: meta.volume ?? 1,
+          clips: [clip],
+        },
       ]);
       return { trackId, clipId };
     },
-    [beginGesture],
+    [commitTracks],
   );
 
   const moveClip = useCallback((trackId, clipId, newStart) => {
@@ -256,7 +321,7 @@ export function useTimeline(sampler) {
           ? {
               ...t,
               clips: t.clips.map((c) =>
-                c.id === clipId ? { ...c, start: Math.max(0, newStart) } : c,
+                c.id === clipId ? { ...c, start: clampMoveStart(newStart) } : c,
               ),
             }
           : t,
@@ -269,74 +334,63 @@ export function useTimeline(sampler) {
   // Leaks are bounded by the length of one session.
   const removeClip = useCallback(
     (trackId, clipId) => {
-      beginGesture();
-      setTracks((prev) =>
-        prev.map((t) =>
-          t.id === trackId ? { ...t, clips: t.clips.filter((c) => c.id !== clipId) } : t,
-        ),
-      );
+      commitTracks((prev) => {
+        let changed = false;
+        const next = prev.map((t) => {
+          if (t.id !== trackId) return t;
+          const clips = t.clips.filter((c) => c.id !== clipId);
+          if (clips.length === t.clips.length) return t;
+          changed = true;
+          return { ...t, clips };
+        });
+        return changed ? next : prev;
+      });
     },
-    [beginGesture],
+    [commitTracks],
   );
 
   const removeTrack = useCallback(
     (trackId) => {
-      beginGesture();
-      setTracks((prev) => prev.filter((x) => x.id !== trackId));
+      commitTracks((prev) => {
+        const next = prev.filter((x) => x.id !== trackId);
+        return next.length === prev.length ? prev : next;
+      });
     },
-    [beginGesture],
+    [commitTracks],
   );
 
   // Replace a time region [regStart, regEnd] (timeline seconds) of one clip
   // with a freshly generated buffer — the section-regenerate splice. Splits
   // the original into head / new / tail clips that share the same buffer.
   const replaceRegion = useCallback((trackId, clipId, regStart, regEnd, newBuffer, meta = {}) => {
-    beginGesture();
-    setTracks((prev) =>
-      prev.map((t) => {
+    commitTracks((prev) => {
+      let changed = false;
+      const next = prev.map((t) => {
         if (t.id !== trackId) return t;
         const idx = t.clips.findIndex((c) => c.id === clipId);
         if (idx < 0) return t;
         const c = t.clips[idx];
-        const clipEnd = c.start + c.duration;
-        const a = Math.max(c.start, regStart);
-        const b = Math.min(clipEnd, regEnd);
-        const pieces = [];
-
-        if (a > c.start) {
-          const headId = uid('clip');
-          buffersRef.current[headId] = buffersRef.current[c.id];
-          pieces.push({ ...c, id: headId, start: c.start, offset: c.offset, duration: a - c.start });
-        }
-        const midId = uid('clip');
-        buffersRef.current[midId] = newBuffer;
-        pieces.push({
-          id: midId,
-          start: a,
-          offset: 0,
+        const replacement = {
           duration: meta.duration ?? newBuffer.duration,
           part: c.part,
           prompt: meta.prompt ?? c.prompt,
           seed: meta.seed ?? null,
           backendUsed: meta.backendUsed ?? null,
           startBar: meta.startBar ?? c.startBar ?? 0,
+          audioUrl: meta.audioUrl ?? null,
+        };
+        const result = replacementPieces(c, regStart, regEnd, replacement, () => uid('clip'));
+        if (!result) return t;
+        result.pieces.forEach((piece) => {
+          buffersRef.current[piece.id] = piece.id === result.replacementId ? newBuffer : buffersRef.current[c.id];
         });
-        if (b < clipEnd) {
-          const tailId = uid('clip');
-          buffersRef.current[tailId] = buffersRef.current[c.id];
-          pieces.push({
-            ...c,
-            id: tailId,
-            start: b,
-            offset: c.offset + (b - c.start),
-            duration: clipEnd - b,
-          });
-        }
-        const clips = [...t.clips.slice(0, idx), ...pieces, ...t.clips.slice(idx + 1)];
+        const clips = [...t.clips.slice(0, idx), ...result.pieces, ...t.clips.slice(idx + 1)];
+        changed = true;
         return { ...t, clips };
-      }),
-    );
-  }, [beginGesture]);
+      });
+      return changed ? next : prev;
+    });
+  }, [commitTracks]);
 
   // Patch arbitrary fields of one clip (used by edge-trim: start/offset/duration).
   const updateClip = useCallback((trackId, clipId, patch) => {
@@ -349,33 +403,44 @@ export function useTimeline(sampler) {
     );
   }, []);
 
+  const patchClip = useCallback((trackId, clipId, patch) => {
+    commitTracks((prev) => {
+      let changed = false;
+      const next = prev.map((t) => {
+        if (t.id !== trackId) return t;
+        return {
+          ...t,
+          clips: t.clips.map((c) => {
+            if (c.id !== clipId) return c;
+            changed = true;
+            return { ...c, ...patch };
+          }),
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, [commitTracks]);
+
   // Split one clip at a timeline time into two clips sharing the same buffer.
   const splitClip = useCallback(
     (trackId, clipId, atTime) => {
-      beginGesture();
-      setTracks((prev) =>
-        prev.map((t) => {
+      commitTracks((prev) => {
+        let changed = false;
+        const next = prev.map((t) => {
           if (t.id !== trackId) return t;
           const idx = t.clips.findIndex((c) => c.id === clipId);
           if (idx < 0) return t;
           const c = t.clips[idx];
-          if (atTime <= c.start + 0.02 || atTime >= c.start + c.duration - 0.02) return t;
-          const leftDur = atTime - c.start;
-          const rightId = uid('clip');
-          buffersRef.current[rightId] = buffersRef.current[c.id];
-          const left = { ...c, duration: leftDur };
-          const right = {
-            ...c,
-            id: rightId,
-            start: atTime,
-            offset: c.offset + leftDur,
-            duration: c.duration - leftDur,
-          };
-          return { ...t, clips: [...t.clips.slice(0, idx), left, right, ...t.clips.slice(idx + 1)] };
-        }),
-      );
+          const pieces = splitClipPieces(c, atTime, () => uid('clip'));
+          if (!pieces) return t;
+          buffersRef.current[pieces.right.id] = buffersRef.current[c.id];
+          changed = true;
+          return { ...t, clips: [...t.clips.slice(0, idx), pieces.left, pieces.right, ...t.clips.slice(idx + 1)] };
+        });
+        return changed ? next : prev;
+      });
     },
-    [beginGesture],
+    [commitTracks],
   );
 
   // Cut a selected region out of a clip as its own clip, leaving the head and
@@ -387,69 +452,90 @@ export function useTimeline(sampler) {
   const extractRegion = useCallback(
     (trackId, clipId, a, b) => {
       const midId = uid('clip');
-      beginGesture();
-      setTracks((prev) =>
-        prev.map((t) => {
+      commitTracks((prev) => {
+        let changed = false;
+        const next = prev.map((t) => {
           if (t.id !== trackId) return t;
           const idx = t.clips.findIndex((c) => c.id === clipId);
           if (idx < 0) return t;
           const c = t.clips[idx];
-          const clipEnd = c.start + c.duration;
-          const from = Math.max(c.start, Math.min(a, b));
-          const to = Math.min(clipEnd, Math.max(a, b));
-          if (to - from < 0.02) return t;
-
-          const pieces = [];
-          if (from > c.start + 0.02) {
-            const headId = uid('clip');
-            buffersRef.current[headId] = buffersRef.current[c.id];
-            pieces.push({ ...c, id: headId, duration: from - c.start });
-          }
-
-          buffersRef.current[midId] = buffersRef.current[c.id];
-          pieces.push({
-            ...c,
-            id: midId,
-            start: from,
-            offset: c.offset + (from - c.start),
-            duration: to - from,
+          const result = extractRegionPieces(c, a, b, () => uid('clip'), 0.02, midId);
+          if (!result) return t;
+          result.pieces.forEach((piece) => {
+            buffersRef.current[piece.id] = buffersRef.current[c.id];
           });
-
-          if (to < clipEnd - 0.02) {
-            const tailId = uid('clip');
-            buffersRef.current[tailId] = buffersRef.current[c.id];
-            pieces.push({
-              ...c,
-              id: tailId,
-              start: to,
-              offset: c.offset + (to - c.start),
-              duration: clipEnd - to,
-            });
-          }
-
-          return { ...t, clips: [...t.clips.slice(0, idx), ...pieces, ...t.clips.slice(idx + 1)] };
-        }),
-      );
+          changed = true;
+          return { ...t, clips: [...t.clips.slice(0, idx), ...result.pieces, ...t.clips.slice(idx + 1)] };
+        });
+        return changed ? next : prev;
+      });
       return midId;
     },
-    [beginGesture],
+    [commitTracks],
   );
 
   const duplicateClip = useCallback(
     (trackId, clipId) => {
-      beginGesture();
-      setTracks((prev) =>
-        prev.map((t) => {
+      commitTracks((prev) => {
+        let changed = false;
+        const next = prev.map((t) => {
           if (t.id !== trackId) return t;
           const c = t.clips.find((x) => x.id === clipId);
           if (!c) return t;
-          const copyId = uid('clip');
-          buffersRef.current[copyId] = buffersRef.current[c.id];
-          return { ...t, clips: [...t.clips, { ...c, id: copyId, start: c.start + c.duration }] };
-        }),
-      );
+          const copy = duplicateClipPiece(c, () => uid('clip'));
+          buffersRef.current[copy.id] = buffersRef.current[c.id];
+          changed = true;
+          return { ...t, clips: [...t.clips, copy] };
+        });
+        return changed ? next : prev;
+      });
     },
-    [beginGesture],
+    [commitTracks],
+  );
+
+  const removeRegion = useCallback(
+    (trackId, clipId, a, b) => {
+      return commitTracks((prev) => {
+        let changed = false;
+        const next = prev.map((t) => {
+          if (t.id !== trackId) return t;
+          const idx = t.clips.findIndex((c) => c.id === clipId);
+          if (idx < 0) return t;
+          const c = t.clips[idx];
+          const result = deleteRegionPieces(c, a, b, () => uid('clip'));
+          if (!result) return t;
+          result.pieces.forEach((piece) => {
+            buffersRef.current[piece.id] = buffersRef.current[c.id];
+          });
+          changed = true;
+          return { ...t, clips: [...t.clips.slice(0, idx), ...result.pieces, ...t.clips.slice(idx + 1)] };
+        });
+        return changed ? next : prev;
+      });
+    },
+    [commitTracks],
+  );
+
+  const duplicateRegion = useCallback(
+    (trackId, clipId, a, b) => {
+      const copyId = uid('clip');
+      const committed = commitTracks((prev) => {
+        let changed = false;
+        const next = prev.map((t) => {
+          if (t.id !== trackId) return t;
+          const c = t.clips.find((x) => x.id === clipId);
+          if (!c) return t;
+          const copy = duplicateRegionPiece(c, a, b, () => copyId);
+          if (!copy) return t;
+          buffersRef.current[copy.id] = buffersRef.current[c.id];
+          changed = true;
+          return { ...t, clips: [...t.clips, copy] };
+        });
+        return changed ? next : prev;
+      });
+      return committed ? copyId : null;
+    },
+    [commitTracks],
   );
 
   // Solo is a whole-mix decision — one track going solo silences every other
@@ -473,14 +559,24 @@ export function useTimeline(sampler) {
 
   const setTrackProp = useCallback(
     (trackId, prop, value) => {
-      setTracks((prev) => {
+      commitTracks((prev) => {
         // Solo is exclusive, like a mixing desk: soloing one track drops the
         // solo on every other, so the mix always answers "which single track
         // am I hearing". Un-soloing just clears it.
+        let changed = false;
         const next = prev.map((t) => {
-          if (t.id === trackId) return { ...t, [prop]: value };
-          return prop === 'soloed' && value && t.soloed ? { ...t, soloed: false } : t;
+          if (t.id === trackId) {
+            if (t[prop] === value) return t;
+            changed = true;
+            return { ...t, [prop]: value };
+          }
+          if (prop === 'soloed' && value && t.soloed) {
+            changed = true;
+            return { ...t, soloed: false };
+          }
+          return t;
         });
+        if (!changed) return prev;
         // Volume, mute and solo have to take effect on the click, not at the
         // next play. The gain nodes live outside React, so update them from
         // the list just built — reading `tracks` here would be a render behind.
@@ -488,7 +584,7 @@ export function useTimeline(sampler) {
         return next;
       });
     },
-    [applyTrackGains],
+    [applyTrackGains, commitTracks],
   );
 
   // --- transport ---------------------------------------------------------
@@ -519,7 +615,8 @@ export function useTimeline(sampler) {
     buffersRef.current = {};
     pastRef.current = [];
     futureRef.current = [];
-    setTracks([]);
+    tracksRef.current = [];
+    setTracksState([]);
     setLoop(null);
     bumpHistory();
   }, [stop, setLoop]);
@@ -566,11 +663,16 @@ export function useTimeline(sampler) {
           src.connect(gain);
           if (c.start >= from) {
             // Starts in the future.
-            src.start(startAt + (c.start - from), c.offset, c.duration);
+            const playDuration = Math.min(c.duration, buffer.duration - c.offset);
+            if (playDuration <= 0) return;
+            src.start(startAt + (c.start - from), c.offset, playDuration);
           } else {
             // Straddles the playhead — begin partway in.
             const into = from - c.start;
-            src.start(startAt, c.offset + into, c.duration - into);
+            const bufferOffset = c.offset + into;
+            const playDuration = Math.min(c.duration - into, buffer.duration - bufferOffset);
+            if (playDuration <= 0) return;
+            src.start(startAt, bufferOffset, playDuration);
           }
           nodesRef.current.push(src);
         });
@@ -636,10 +738,13 @@ export function useTimeline(sampler) {
     attachBuffer,
     moveClip,
     updateClip,
+    patchClip,
     splitClip,
     extractRegion,
     duplicateClip,
+    duplicateRegion,
     removeClip,
+    removeRegion,
     removeTrack,
     replaceRegion,
     setTrackProp,

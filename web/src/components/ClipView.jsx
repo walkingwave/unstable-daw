@@ -22,9 +22,12 @@ export default function ClipView({
   selected,
   region,
   onSelect,
+  onBeginGesture,
   onMove,
+  onMoveEnd,
   onMoveById,
   onTrim,
+  onTrimEnd,
   onExtract,
   onRange,
 }) {
@@ -116,12 +119,13 @@ export default function ClipView({
   const eventTime = (ev, laneLeft) => (ev.clientX - laneLeft) / pps;
 
   // Attach a drag that runs `onDrag(deltaSeconds)` until pointer-up.
-  const dragFrom = (e, onDrag) => {
+  const dragFrom = (e, onDrag, onEnd) => {
     const startX = e.clientX;
     const move = (ev) => onDrag((ev.clientX - startX) / pps);
     const up = () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
+      onEnd?.();
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
@@ -134,8 +138,19 @@ export default function ClipView({
   const titleDown = (e) => {
     e.stopPropagation();
     onSelect();
+    onBeginGesture();
     const origStart = clip.start;
-    dragFrom(e, (delta) => onMove(snap(origStart + delta)));
+    let latestStart = origStart;
+    dragFrom(
+      e,
+      (delta) => {
+        latestStart = snap(origStart + delta);
+        onMove(latestStart);
+      },
+      () => {
+        if (latestStart !== origStart) onMoveEnd?.(origStart, latestStart);
+      },
+    );
   };
 
   // Dragging on the waveform highlights a section; dragging from inside an
@@ -165,14 +180,18 @@ export default function ClipView({
   const trimDown = (side) => (e) => {
     e.stopPropagation();
     onSelect();
+    onBeginGesture();
     const laneLeft = e.currentTarget.parentElement.parentElement.getBoundingClientRect().left;
+    let latestT = null;
     const move = (ev) => {
       const t = snap(eventTime(ev, laneLeft));
+      latestT = t;
       onTrim(side, t);
     };
     const up = () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
+      if (latestT != null) onTrimEnd?.(side, latestT);
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);

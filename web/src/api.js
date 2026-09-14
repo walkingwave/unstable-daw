@@ -51,9 +51,6 @@ export const transformHum = (body) => postJSON('/transform-hum', body);
 // Start a session with no source audio, for composing from nothing.
 export const createBlankSession = (body) => postJSON('/session/blank', body);
 
-// Interpret a plain-English request into a generation plan. The server uses
-// DeepSeek when configured and falls back to keyword matching, so this always
-// returns a plan rather than failing.
 // Played notes + a prompt -> a real instrument. The notes become the guide
 // track, so the performance survives and only the timbre is generated.
 export const generateFromMidi = (body) => postJSON('/generate-from-midi', body);
@@ -65,6 +62,15 @@ export const instrumentSamples = (body) => postJSON('/instrument/samples', body)
 export const interpret = (text, sessionId, mode) =>
   postJSON('/interpret', { text, session_id: sessionId ?? null, mode: mode ?? null });
 
+// Studio chat -> explicit timeline/backend actions. The server uses DeepSeek
+// when configured and falls back to deterministic parsing.
+export const planAgentActions = ({ message, sessionId, studioContext }) =>
+  postJSON('/agent/plan', {
+    message,
+    session_id: sessionId ?? null,
+    studio_context: studioContext ?? {},
+  });
+
 // Describe a part in words, get back NOTES rather than audio. The phrase
 // lands on a MIDI track, so it stays editable in the piano roll.
 export const composeMidi = (body) => postJSON('/compose-midi', body);
@@ -75,6 +81,28 @@ export const generateSong = (body) => postJSON('/generate-song', body);
 
 // What the long-running song pipeline is doing right now, for the status bar.
 export const sessionProgress = (sessionId) => api(`/session/${sessionId}/progress`);
+
+export const getTimeline = (sessionId) => api(`/session/${sessionId}/timeline`);
+
+export const saveTimeline = (sessionId, timeline) =>
+  api(`/session/${sessionId}/timeline`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(timeline),
+  });
+
+export const listOperations = (sessionId, limit = 100) =>
+  api(`/session/${sessionId}/operations?limit=${limit}`);
+
+export const recordOperation = (sessionId, operation) =>
+  postJSON(`/session/${sessionId}/operations`, operation);
+
+export async function uploadSessionAudio(sessionId, blob, name = 'clip') {
+  const form = new FormData();
+  form.append('name', name);
+  form.append('audio', blob, `${name}.wav`);
+  return api(`/session/${sessionId}/uploads/audio`, { method: 'POST', body: form });
+}
 
 // Generate a clip guided by audio the user picked, rather than by a guide
 // track synthesized from the chord grid. `referenceWav` is a Blob.

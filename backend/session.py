@@ -51,7 +51,7 @@ class Session:
         session_id = uuid.uuid4().hex[:12]
         session = cls(id=session_id, root=SESSIONS_DIR / session_id)
 
-        for subdir in ("guides", "stems", "midi"):
+        for subdir in ("guides", "stems", "midi", "uploads"):
             (session.root / subdir).mkdir(parents=True, exist_ok=True)
 
         sf.write(session.vocal_path, vocal, sr)
@@ -92,6 +92,9 @@ class Session:
 
     def midi_path(self, track: str) -> Path:
         return self.root / "midi" / f"{track}.mid"
+
+    def upload_path(self, filename: str) -> Path:
+        return self.root / "uploads" / filename
 
     # --- audio ---------------------------------------------------------
 
@@ -231,6 +234,35 @@ class Session:
         meta = self._read_meta()
         meta.setdefault("transforms", {})[name] = transform
         self._write_meta(meta)
+
+    @property
+    def timeline(self) -> dict | None:
+        return self._read_meta().get("timeline")
+
+    def save_timeline(self, timeline: dict) -> dict:
+        meta = self._read_meta()
+        meta["timeline"] = timeline
+        self._write_meta(meta)
+        return meta["timeline"]
+
+    def operations(self, limit: int = 100) -> list[dict]:
+        ops = self._read_meta().get("operations") or []
+        return ops[-limit:]
+
+    def record_operation(self, operation: dict) -> dict:
+        meta = self._read_meta()
+        ops = meta.setdefault("operations", [])
+        entry = {
+            "id": uuid.uuid4().hex[:12],
+            "created_at": _now(),
+            **operation,
+        }
+        ops.append(entry)
+        # Keep meta.json bounded; this is history for agent context, not an
+        # audit log that needs to grow forever.
+        meta["operations"] = ops[-200:]
+        self._write_meta(meta)
+        return entry
 
     def to_dict(self) -> dict:
         return self._read_meta()

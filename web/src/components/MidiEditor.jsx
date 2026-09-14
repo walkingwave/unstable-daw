@@ -325,7 +325,7 @@ export default function MidiEditor({
         <InstrumentSlot
           instrument={track.instrument}
           instruments={instruments}
-          loading={sampler?.loading}
+          loading={!!sampler?.isLoading(track.instrument)}
           ready={hasInstrument}
           onLoad={onLoadInstrument}
           onClear={() => onLoadInstrument(null)}

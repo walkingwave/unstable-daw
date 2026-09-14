@@ -1685,7 +1685,7 @@ function TrackHeader({ track, height, instruments, sampler, onLoadInstrument, on
             compact
             instrument={track.instrument}
             instruments={instruments}
-            loading={sampler?.loading}
+            loading={!!sampler?.isLoading(track.instrument)}
             ready={sampler?.isLoaded(track.instrument)}
             onLoad={onLoadInstrument}
             onClear={() => onLoadInstrument(null)}

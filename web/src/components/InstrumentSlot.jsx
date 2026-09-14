@@ -92,7 +92,7 @@ export default function InstrumentSlot({
 
   const label = !instrument
     ? 'empty slot'
-    : loading === instrument.id
+    : loading
       ? 'loading…'
       : ready
         ? instrument.name
@@ -103,7 +103,7 @@ export default function InstrumentSlot({
       <button
         ref={buttonRef}
         className={`slot-btn${instrument ? ' loaded' : ''}${
-          loading === instrument?.id ? ' busy' : ''
+          instrument && loading ? ' busy' : ''
         }`}
         onClick={() => setOpen((v) => !v)}
         title={instrument ? instrument.prompt : 'Load an instrument into this track'}
@@ -117,7 +117,7 @@ export default function InstrumentSlot({
           <div className="slot-pop-list">
             {instruments.length === 0 && (
               <div className="slot-empty">
-                No instruments yet — make one on the New Instrument tab.
+                No instruments yet — make one on the Instruments tab.
               </div>
             )}
             {instruments.map((i) => (

@@ -52,9 +52,14 @@ export default function App() {
   const vocalWavRef = useRef(null); // the analyzed vocal as a WAV blob
   const vocalAddedRef = useRef(false);
 
+  // One timer for the one toast. Per-message timers meant flashing the same
+  // text twice ("Could not load…" on retry) let the first timer hide the
+  // second toast after a fraction of its four seconds.
+  const toastTimerRef = useRef(null);
   const flash = useCallback((message) => {
     setToast(message);
-    window.setTimeout(() => setToast((c) => (c === message ? null : c)), 4000);
+    window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 4000);
   }, []);
 
   // MIDI notes are stored in beats, so playback needs the current tempo.
@@ -220,6 +225,14 @@ export default function App() {
       flash(`Could not list projects — ${error.message}`);
     }
   }, [refreshSessions, flash]);
+
+  // The picker is a modal, so it should close the way modals do.
+  useEffect(() => {
+    if (!sessionPickerOpen) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') setSessionPickerOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [sessionPickerOpen]);
 
   const isLostSession = (error) => /404|no such session/i.test(error.message || '');
   const resetSession = useCallback(() => {
@@ -698,7 +711,11 @@ export default function App() {
       )}
 
       {sessionPickerOpen && (
-        <div className="modal-backdrop" role="presentation">
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onPointerDown={(e) => { if (e.target === e.currentTarget) setSessionPickerOpen(false); }}
+        >
           <section className="session-picker" role="dialog" aria-modal="true" aria-label="Open project">
             <div className="row"><h2>Projects</h2><button onClick={() => setSessionPickerOpen(false)}>Close</button></div>
             {!sessions.length ? <p>No saved projects.</p> : sessions.map((item) => (

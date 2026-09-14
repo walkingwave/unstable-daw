@@ -535,6 +535,10 @@ def instrument_samples(request: SamplesRequest) -> dict:
 
 @app.get("/api/instrument/{ident}/{index}.wav")
 def instrument_sample(ident: str, index: int) -> FileResponse:
+    # Ids are hex digests (instruments.instrument_id). Anything else, "..",
+    # say, would walk out of the instrument cache.
+    if len(ident) != 16 or any(c not in "0123456789abcdef" for c in ident) or index < 0:
+        raise HTTPException(404, "sample not found")
     path = config.CACHE_DIR / "instruments" / ident / f"{index}.wav"
     if not path.is_file():
         raise HTTPException(404, "sample not found")

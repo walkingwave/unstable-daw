@@ -21,8 +21,13 @@ export function useSampler() {
   // instrumentId -> { type: 'soundfont', buffers: Map<pitch, AudioBuffer> }
   //              | { type: 'generated', samples: [{actualPitch, buffer}] }
   const loadedRef = useRef(new Map());
+  // instrumentId -> Promise of the entry, while a load is in flight.
+  const pendingRef = useRef(new Map());
   const ctxRef = useRef(null);
-  const [loading, setLoading] = useState(null);
+  // Every instrument currently loading. A single id was not enough: restoring
+  // a project loads several at once, and the first to finish cleared the
+  // "loading…" label on slots whose sound was still on its way.
+  const [loadingIds, setLoadingIds] = useState(() => new Set());
 
   const context = useCallback(() => {
     if (!ctxRef.current) ctxRef.current = new AudioContext();
@@ -32,6 +37,11 @@ export function useSampler() {
   const isLoaded = useCallback((instrument) => {
     return instrument ? loadedRef.current.has(instrument.id) : false;
   }, []);
+
+  const isLoading = useCallback(
+    (instrument) => (instrument ? loadingIds.has(instrument.id) : false),
+    [loadingIds],
+  );
 
   const loadGenerated = useCallback(
     async (instrument, backend) => {
@@ -62,41 +72,62 @@ export function useSampler() {
   // Audio even when the description happens to name a GM instrument.
   // Soundfonts remain the fallback either way, so an offline demo or a failed
   // generation still makes sound.
+  const resolve = useCallback(
+    async (instrument, backend) => {
+      const gm = matchPrompt(instrument.prompt);
+      const isFactory = String(instrument.id || '').startsWith('f-');
+      let entry = null;
+
+      if (isFactory && gm) {
+        try {
+          entry = { type: 'soundfont', gm, buffers: await loadSoundfont(gm, context()) };
+        } catch (error) {
+          console.warn(`soundfont ${gm} unavailable, generating instead:`, error);
+        }
+      }
+      if (!entry) {
+        try {
+          entry = await loadGenerated(instrument, backend);
+        } catch (error) {
+          if (!gm) throw error;
+          console.warn('generation failed, falling back to soundfont:', error);
+          entry = { type: 'soundfont', gm, buffers: await loadSoundfont(gm, context()) };
+        }
+      }
+      return entry;
+    },
+    [context, loadGenerated],
+  );
+
+  // Loads are shared while in flight. A restore, a new track and a slot click
+  // can all ask for the same instrument within a second of each other, and
+  // each used to start its own generation — paying for the same one-shots
+  // two or three times.
   const load = useCallback(
     async (instrument, { backend } = {}) => {
       if (!instrument?.prompt) throw new Error('this instrument has no description');
-      if (loadedRef.current.has(instrument.id)) return loadedRef.current.get(instrument.id);
+      const id = instrument.id;
+      if (loadedRef.current.has(id)) return loadedRef.current.get(id);
+      if (pendingRef.current.has(id)) return pendingRef.current.get(id);
 
-      setLoading(instrument.id);
-      try {
-        let entry = null;
-        const gm = matchPrompt(instrument.prompt);
-        const isFactory = String(instrument.id || '').startsWith('f-');
-
-        if (isFactory && gm) {
-          try {
-            entry = { type: 'soundfont', gm, buffers: await loadSoundfont(gm, context()) };
-          } catch (error) {
-            console.warn(`soundfont ${gm} unavailable, generating instead:`, error);
-          }
-        }
-        if (!entry) {
-          try {
-            entry = await loadGenerated(instrument, backend);
-          } catch (error) {
-            if (!gm) throw error;
-            console.warn('generation failed, falling back to soundfont:', error);
-            entry = { type: 'soundfont', gm, buffers: await loadSoundfont(gm, context()) };
-          }
-        }
-
-        loadedRef.current.set(instrument.id, entry);
+      const task = resolve(instrument, backend).then((entry) => {
+        loadedRef.current.set(id, entry);
         return entry;
+      });
+      pendingRef.current.set(id, task);
+      setLoadingIds((ids) => new Set(ids).add(id));
+      try {
+        return await task;
       } finally {
-        setLoading(null);
+        pendingRef.current.delete(id);
+        setLoadingIds((ids) => {
+          const next = new Set(ids);
+          next.delete(id);
+          return next;
+        });
       }
     },
-    [context, loadGenerated],
+    [resolve],
   );
 
   // The source nearest the requested pitch, so nothing is stretched
@@ -239,5 +270,5 @@ export function useSampler() {
     [context],
   );
 
-  return { load, play, noteOn, isLoaded, loading, context };
+  return { load, play, noteOn, isLoaded, isLoading, context };
 }
